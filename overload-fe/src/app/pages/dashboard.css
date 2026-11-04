@@ -1,0 +1,625 @@
+/* ==========================================================
+   OVERWATCH AI - PROFESSIONAL DASHBOARD CSS
+   Dark AI Surveillance Theme
+   ========================================================== */
+
+@import url("https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap");
+
+/* ================= RESET ================= */
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+:root{
+  --bg:#020817;
+  --surface:#081324;
+  --surface-light:#0E1D34;
+  --surface-hover:#12233D;
+  --border:#19304D;
+
+  --primary:#22C55E;
+  --primary-dark:#16A34A;
+
+  --blue:#2563EB;
+  --cyan:#06B6D4;
+  --orange:#F59E0B;
+  --red:#EF4444;
+  --yellow:#FBBF24;
+
+  --text:#F8FAFC;
+  --muted:#94A3B8;
+}
+
+html,
+body,
+#root{
+  width:100%;
+  min-height:100%;
+  font-family:"Inter",sans-serif;
+  background:var(--bg);
+  color:var(--text);
+}
+
+/* ================= DASHBOARD ================= */
+
+.dashboard{
+  width:100%;
+  min-height:100vh;
+  padding:28px;
+  background:
+      radial-gradient(circle at top right,#12364d33,transparent 40%),
+      radial-gradient(circle at bottom left,#16A34A22,transparent 40%),
+      var(--bg);
+}
+
+/* ================= HEADER ================= */
+
+.dashboard-header{
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+  margin-bottom:28px;
+  flex-wrap:wrap;
+  gap:16px;
+}
+
+.dashboard-header h1{
+  font-size:2rem;
+  font-weight:800;
+  color:white;
+}
+
+.dashboard-header p{
+  color:var(--muted);
+  margin-top:4px;
+}
+
+.refresh-btn{
+  background:linear-gradient(135deg,var(--primary),var(--primary-dark));
+  border:none;
+  color:white;
+  padding:12px 22px;
+  border-radius:14px;
+  font-weight:700;
+  cursor:pointer;
+  transition:.25s;
+  display:flex;
+  gap:10px;
+  align-items:center;
+}
+
+.refresh-btn:hover{
+  transform:translateY(-2px);
+  box-shadow:0 10px 25px rgba(34,197,94,.25);
+}
+
+/* ================= STATS ================= */
+
+.stats-grid{
+  display:grid;
+  grid-template-columns:repeat(auto-fit,minmax(180px,1fr));
+  gap:18px;
+  margin-bottom:30px;
+}
+
+.stat-card{
+  background:linear-gradient(180deg,var(--surface),var(--surface-light));
+  border:1px solid var(--border);
+  border-radius:22px;
+  padding:20px;
+  transition:.3s;
+  position:relative;
+  overflow:hidden;
+}
+
+.stat-card:hover{
+  transform:translateY(-4px);
+  border-color:#22C55E55;
+}
+
+.stat-card::after{
+  content:"";
+  position:absolute;
+  top:0;
+  left:0;
+  width:4px;
+  height:100%;
+  background:var(--primary);
+}
+
+.stat-title{
+  color:var(--muted);
+  font-size:.8rem;
+  text-transform:uppercase;
+  letter-spacing:.08em;
+}
+
+.stat-value{
+  font-size:2rem;
+  font-weight:800;
+  margin-top:10px;
+}
+
+.stat-icon{
+  position:absolute;
+  top:20px;
+  right:20px;
+  opacity:.25;
+  transform:scale(1.4);
+}
+
+/* ================= SURVEILLANCE SECTION ================= */
+
+.surveillance-section{
+  display:grid;
+  grid-template-columns:330px 1fr;
+  gap:24px;
+  margin-bottom:28px;
+}
+
+/* ================= INFO PANEL ================= */
+
+.info-frame{
+  background:var(--surface);
+  border-radius:24px;
+  border:1px solid var(--border);
+  padding:22px;
+  display:flex;
+  flex-direction:column;
+  gap:18px;
+}
+
+.info-title{
+  font-size:1.1rem;
+  font-weight:700;
+  color:#4ADE80;
+}
+
+.info-card{
+  background:var(--surface-light);
+  border:1px solid #1E3A5F;
+  border-radius:18px;
+  padding:16px;
+}
+
+.info-card span{
+  display:block;
+  color:var(--muted);
+  font-size:.75rem;
+  margin-bottom:6px;
+}
+
+.info-card h2{
+  font-size:1.4rem;
+  color:white;
+}
+
+.info-card p{
+  color:#CBD5E1;
+}
+
+/* ================= CAMERA PANEL ================= */
+
+.video-panel{
+  background:var(--surface);
+  border-radius:24px;
+  border:1px solid var(--border);
+  padding:20px;
+}
+
+.panel-header{
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+  margin-bottom:18px;
+  flex-wrap:wrap;
+  gap:12px;
+}
+
+.panel-title{
+  font-size:1.1rem;
+  font-weight:700;
+}
+
+.toolbar{
+  display:flex;
+  flex-wrap:wrap;
+  gap:10px;
+}
+
+.toolbar button{
+  background:#132540;
+  color:white;
+  border:none;
+  padding:10px 16px;
+  border-radius:12px;
+  cursor:pointer;
+  transition:.25s;
+  display:flex;
+  align-items:center;
+  gap:8px;
+}
+
+.toolbar button:hover{
+  background:var(--primary);
+}
+
+/* ================= CAMERA STREAM ================= */
+
+.camera-stream-container{
+  position:relative;
+  width:100%;
+  aspect-ratio:16/9;
+  border-radius:22px;
+  overflow:hidden;
+  background:black;
+  border:2px solid rgba(34,197,94,.4);
+}
+
+.camera-stream{
+  width:100%;
+  height:100%;
+  object-fit:contain;
+  display:block;
+}
+
+/* Detection Zone */
+
+.detection-zone{
+  position:absolute;
+  inset:20px;
+  border:3px solid #22FF88;
+  border-radius:20px;
+  pointer-events:none;
+  box-shadow:0 0 30px rgba(34,255,136,.35);
+}
+
+.detection-zone::before,
+.detection-zone::after{
+  content:"";
+  position:absolute;
+  width:40px;
+  height:40px;
+  border:4px solid #22FF88;
+}
+
+.detection-zone::before{
+  top:-4px;
+  left:-4px;
+  border-right:none;
+  border-bottom:none;
+}
+
+.detection-zone::after{
+  bottom:-4px;
+  right:-4px;
+  border-left:none;
+  border-top:none;
+}
+
+/* LIVE Badge */
+
+.live-indicator{
+  position:absolute;
+  top:18px;
+  right:18px;
+  background:rgba(0,0,0,.75);
+  padding:8px 14px;
+  border-radius:999px;
+  color:#4ADE80;
+  font-weight:700;
+  display:flex;
+  align-items:center;
+  gap:8px;
+}
+
+.live-dot{
+  width:10px;
+  height:10px;
+  border-radius:50%;
+  background:#22FF88;
+  animation:pulse 1s infinite;
+}
+
+/* Bottom Camera Stats */
+
+.camera-footer{
+  position:absolute;
+  left:20px;
+  bottom:20px;
+  display:flex;
+  gap:12px;
+  flex-wrap:wrap;
+}
+
+.camera-chip{
+  background:rgba(0,0,0,.65);
+  color:white;
+  padding:8px 12px;
+  border-radius:999px;
+  font-size:.75rem;
+  backdrop-filter:blur(10px);
+}
+
+/* ================= ALERT BANNER ================= */
+
+.alert-banner{
+  margin:26px 0;
+  background:linear-gradient(90deg,#6B0000,#DC2626);
+  border-radius:20px;
+  padding:18px 22px;
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+  gap:20px;
+  animation:alertFlash 1.4s infinite alternate;
+}
+
+.alert-banner h3{
+  color:#FDE68A;
+}
+
+.alert-image{
+  width:150px;
+  height:90px;
+  border-radius:12px;
+  object-fit:cover;
+  border:2px solid white;
+}
+
+/* ================= LOCATION ================= */
+
+.location-card{
+  background:var(--surface);
+  border:1px solid var(--border);
+  border-radius:22px;
+  padding:22px;
+  margin-bottom:28px;
+}
+
+.location-grid{
+  display:grid;
+  grid-template-columns:repeat(auto-fit,minmax(180px,1fr));
+  gap:16px;
+  margin-top:16px;
+}
+
+.location-item{
+  background:var(--surface-light);
+  padding:16px;
+  border-radius:14px;
+}
+
+.location-item small{
+  color:var(--muted);
+  display:block;
+  margin-bottom:6px;
+}
+
+/* ================= ANALYTICS ================= */
+
+.analytics-row{
+  display:grid;
+  grid-template-columns:repeat(auto-fit,minmax(170px,1fr));
+  gap:16px;
+  margin-bottom:28px;
+}
+
+.analytics-card{
+  background:var(--surface);
+  border-radius:20px;
+  border:1px solid var(--border);
+  padding:18px;
+}
+
+.analytics-card small{
+  color:var(--muted);
+}
+
+.analytics-card h2{
+  margin-top:10px;
+  font-size:2rem;
+}
+
+/* ================= TABLE ================= */
+
+.history-section{
+  background:var(--surface);
+  border-radius:24px;
+  border:1px solid var(--border);
+  padding:22px;
+  margin-bottom:28px;
+}
+
+.table-wrapper{
+  overflow-x:auto;
+}
+
+.history-table{
+  width:100%;
+  border-collapse:collapse;
+  min-width:900px;
+}
+
+.history-table th{
+  background:#0F1F36;
+  color:#4ADE80;
+  padding:16px;
+  text-align:left;
+  font-size:.8rem;
+  text-transform:uppercase;
+}
+
+.history-table td{
+  padding:16px;
+  border-bottom:1px solid #15263E;
+}
+
+.history-table tr:hover{
+  background:#102340;
+}
+
+/* ================= STATUS BADGES ================= */
+
+.badge{
+  padding:6px 12px;
+  border-radius:999px;
+  font-size:.75rem;
+  font-weight:700;
+}
+
+.badge.safe{
+  background:#14532D;
+  color:#4ADE80;
+}
+
+.badge.warning{
+  background:#78350F;
+  color:#FBBF24;
+}
+
+.badge.high{
+  background:#7F1D1D;
+  color:#FCA5A5;
+}
+
+/* ================= SNAPSHOT GALLERY ================= */
+
+.snapshot-gallery{
+  display:grid;
+  grid-template-columns:repeat(auto-fit,minmax(220px,1fr));
+  gap:18px;
+}
+
+.snapshot-card{
+  background:var(--surface);
+  border-radius:20px;
+  overflow:hidden;
+  border:1px solid var(--border);
+  transition:.3s;
+}
+
+.snapshot-card:hover{
+  transform:translateY(-4px);
+}
+
+.snapshot-card img{
+  width:100%;
+  height:160px;
+  object-fit:cover;
+}
+
+.snapshot-content{
+  padding:14px;
+}
+
+.snapshot-content h4{
+  color:white;
+}
+
+.snapshot-content p{
+  color:var(--muted);
+  font-size:.8rem;
+}
+
+/* ================= LOADING ================= */
+
+.camera-overlay{
+  position:absolute;
+  inset:0;
+  background:rgba(2,8,23,.85);
+  display:flex;
+  justify-content:center;
+  align-items:center;
+  flex-direction:column;
+  color:white;
+}
+
+.spinner{
+  width:55px;
+  height:55px;
+  border-radius:50%;
+  border:4px solid rgba(255,255,255,.15);
+  border-top-color:#22C55E;
+  animation:spin 1s linear infinite;
+  margin-bottom:16px;
+}
+
+/* ================= SCROLLBAR ================= */
+
+::-webkit-scrollbar{
+  width:8px;
+}
+
+::-webkit-scrollbar-track{
+  background:#030A14;
+}
+
+::-webkit-scrollbar-thumb{
+  background:#1F3B63;
+  border-radius:999px;
+}
+
+/* ================= ANIMATIONS ================= */
+
+@keyframes spin{
+  to{transform:rotate(360deg);}
+}
+
+@keyframes pulse{
+  0%{box-shadow:0 0 0 0 rgba(34,255,136,.7);}
+  100%{box-shadow:0 0 0 12px transparent;}
+}
+
+@keyframes alertFlash{
+  from{
+    box-shadow:0 0 8px rgba(239,68,68,.3);
+  }
+  to{
+    box-shadow:0 0 25px rgba(239,68,68,.8);
+  }
+}
+
+/* ================= RESPONSIVE ================= */
+
+@media(max-width:1200px){
+
+  .surveillance-section{
+    grid-template-columns:1fr;
+  }
+
+}
+
+@media(max-width:768px){
+
+  .dashboard{
+    padding:16px;
+  }
+
+  .dashboard-header{
+    flex-direction:column;
+    align-items:flex-start;
+  }
+
+  .toolbar{
+    width:100%;
+  }
+
+  .toolbar button{
+    flex:1;
+    justify-content:center;
+  }
+
+  .camera-stream-container{
+    aspect-ratio:4/5;
+  }
+
+  .alert-banner{
+    flex-direction:column;
+    align-items:flex-start;
+  }
+
+}

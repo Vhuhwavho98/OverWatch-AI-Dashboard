@@ -1,0 +1,21 @@
+
+
+.sidebar-item span:first-child {
+  font-size: 24px;
+}
+
+.sidebar-item span:last-child {
+  font-size: 12px;
+  text-align: center;
+}
+
+.sidebar-item:hover {
+  background: #10366b;
+  color: white;
+}
+
+.sidebar-item.active {
+  background: #1d4ed8;
+  color: white;
+  box-shadow: 0 0 15px rgba(37, 99, 235, 0.45);
+}
