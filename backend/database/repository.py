@@ -1,18 +1,35 @@
 # ==========================================================
-# OverWatch AI - SQL Server Repository
-# Handles CRUD and live vehicle-record updates for OverloadDB
-# Compatible with the supplied database/models.py
+# OverWatch AI - CSV Repository
+# Stores and retrieves vehicle detections using detections.csv
+# No SQL Server or database connection required.
 # ==========================================================
 
+import csv
+import threading
 from pathlib import Path
 from datetime import datetime, timedelta
 
-from sqlalchemy import desc
-from sqlalchemy.orm import Session
+# repository.py is expected to be in backend/database/
+# This creates backend/detections.csv.
+CSV_FILE = Path(__file__).resolve().parents[1] / "detections.csv"
 
-from database.database import SessionLocal
-from database.models import Detection
+CSV_FIELDS = [
+    "id",
+    "tracker_id",
+    "vehicle_type",
+    "registration_number",
+    "confidence",
+    "overload_status",
+    "severity_score",
+    "location",
+    "snapshot",
+    "timestamp",
+    "latitude",
+    "longitude",
+]
 
+# Prevent simultaneous writes from threads in this Python process.
+_CSV_LOCK = threading.RLock()
 
 UNKNOWN_REGISTRATIONS = {
     "",
@@ -24,13 +41,22 @@ UNKNOWN_REGISTRATIONS = {
 }
 
 
+class DetectionRecord(dict):
+    """Dictionary record that also supports attribute access (record.id)."""
+
+    def __getattr__(self, name):
+        try:
+            return self[name]
+        except KeyError as exc:
+            raise AttributeError(name) from exc
+
+
 def _clean_registration(value):
     """Return a normalised registration, or None for an unreadable result."""
     if value is None:
         return None
 
-    cleaned = str(value).strip().upper()
-    cleaned = " ".join(cleaned.split())
+    cleaned = " ".join(str(value).strip().upper().split())
 
     if cleaned in UNKNOWN_REGISTRATIONS:
         return None
@@ -39,12 +65,7 @@ def _clean_registration(value):
 
 
 def format_snapshot(snapshot):
-    """
-    Convert a stored snapshot path into a URL served by FastAPI.
-
-    The backend must mount its uploads directory, for example:
-        app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
-    """
+    """Convert a stored snapshot path into a URL served by FastAPI."""
     if not snapshot:
         return None
 
@@ -61,6 +82,99 @@ def format_snapshot(snapshot):
         return "/" + marker + value.split(marker, 1)[1].lstrip("/")
 
     return f"/uploads/snapshots/{Path(value).name}"
+
+
+def _ensure_csv():
+    """Create the CSV file and header if they do not exist."""
+    CSV_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+    if not CSV_FILE.exists() or CSV_FILE.stat().st_size == 0:
+        with CSV_FILE.open("w", newline="", encoding="utf-8-sig") as file:
+            writer = csv.DictWriter(file, fieldnames=CSV_FIELDS)
+            writer.writeheader()
+
+
+def _to_record(row):
+    """Convert a CSV row into a consistently typed detection record."""
+    record = dict(row)
+
+    try:
+        record["id"] = int(record.get("id") or 0)
+    except (TypeError, ValueError):
+        record["id"] = 0
+
+    try:
+        record["tracker_id"] = int(record.get("tracker_id") or 0)
+    except (TypeError, ValueError):
+        record["tracker_id"] = 0
+
+    try:
+        record["confidence"] = float(record.get("confidence") or 0.0)
+    except (TypeError, ValueError):
+        record["confidence"] = 0.0
+
+    try:
+        record["severity_score"] = int(float(record.get("severity_score") or 0))
+    except (TypeError, ValueError):
+        record["severity_score"] = 0
+
+    for field in ("latitude", "longitude"):
+        value = record.get(field)
+        try:
+            record[field] = float(value) if value not in (None, "") else None
+        except (TypeError, ValueError):
+            record[field] = None
+
+    return DetectionRecord(record)
+
+
+def _read_rows():
+    """Read all records from the CSV file."""
+    with _CSV_LOCK:
+        _ensure_csv()
+        with CSV_FILE.open("r", newline="", encoding="utf-8-sig") as file:
+            return [_to_record(row) for row in csv.DictReader(file)]
+
+
+def _write_rows(rows):
+    """Atomically replace the CSV contents with the supplied records."""
+    with _CSV_LOCK:
+        _ensure_csv()
+        temporary_file = CSV_FILE.with_suffix(".csv.tmp")
+
+        with temporary_file.open("w", newline="", encoding="utf-8-sig") as file:
+            writer = csv.DictWriter(file, fieldnames=CSV_FIELDS)
+            writer.writeheader()
+
+            for row in rows:
+                writer.writerow({
+                    field: row.get(field, "")
+                    if row.get(field) is not None
+                    else ""
+                    for field in CSV_FIELDS
+                })
+
+        temporary_file.replace(CSV_FILE)
+
+
+def _next_id(rows):
+    return max((int(row.get("id") or 0) for row in rows), default=0) + 1
+
+
+def _timestamp_value(value):
+    """Parse a stored ISO timestamp, returning None when unavailable."""
+    if not value:
+        return None
+
+    if isinstance(value, datetime):
+        return value
+
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).replace(
+            tzinfo=None
+        )
+    except (TypeError, ValueError):
+        return None
 
 
 def _apply_optional_fields(
@@ -89,7 +203,7 @@ def _apply_optional_fields(
 
     for field, value in values.items():
         if value is not None:
-            setattr(detection, field, value)
+            detection[field] = value
 
 
 # ==========================================================
@@ -108,37 +222,32 @@ def save_detection(
     latitude: float = None,
     longitude: float = None,
 ):
-    """Insert one vehicle detection into SQL Server."""
-    db: Session = SessionLocal()
-
+    """Insert one vehicle detection into detections.csv."""
     try:
-        registration = _clean_registration(registration_number) or "UNKNOWN"
+        with _CSV_LOCK:
+            rows = _read_rows()
+            detection = DetectionRecord({
+                "id": _next_id(rows),
+                "tracker_id": int(tracker_id),
+                "vehicle_type": vehicle_type,
+                "registration_number": _clean_registration(registration_number) or "UNKNOWN",
+                "confidence": float(confidence or 0.0),
+                "overload_status": overload_status or "INDETERMINATE",
+                "severity_score": int(severity_score or 0),
+                "location": location or "Unknown",
+                "snapshot": snapshot or "",
+                "timestamp": datetime.utcnow().isoformat(),
+                "latitude": latitude,
+                "longitude": longitude,
+            })
 
-        detection = Detection(
-            tracker_id=int(tracker_id),
-            vehicle_type=vehicle_type,
-            registration_number=registration,
-            confidence=float(confidence or 0.0),
-            overload_status=overload_status or "INDETERMINATE",
-            severity_score=int(severity_score or 0),
-            location=location,
-            snapshot=snapshot,
-            latitude=latitude,
-            longitude=longitude,
-        )
-
-        db.add(detection)
-        db.commit()
-        db.refresh(detection)
-        return detection
+            rows.append(detection)
+            _write_rows(rows)
+            return detection
 
     except Exception as exc:
-        db.rollback()
-        print(f"[DATABASE] Save detection failed: {exc}")
+        print(f"[CSV] Save detection failed: {exc}")
         raise
-
-    finally:
-        db.close()
 
 
 # ==========================================================
@@ -161,60 +270,59 @@ def update_detection_by_tracker_id(
     """
     Update the newest recent record for this tracker ID and location.
 
-    A recognised ANPR result updates registration_number. An UNKNOWN or
-    empty OCR result never overwrites a registration already recognised.
-
-    The five-minute limit reduces accidental updates to old records if
-    ByteTrack reuses an ID after a restart. For robust multi-camera or
-    long-running deployments, add a camera/session ID to the database key.
+    A recognised ANPR result updates the registration. UNKNOWN OCR results
+    never overwrite a registration that has already been recognised.
     """
-    db: Session = SessionLocal()
-
     try:
-        query = db.query(Detection).filter(
-            Detection.tracker_id == int(tracker_id)
-        )
+        with _CSV_LOCK:
+            rows = _read_rows()
+            cutoff = datetime.utcnow() - timedelta(minutes=max_age_minutes)
 
-        if location is not None:
-            query = query.filter(Detection.location == location)
+            matches = []
+            for index, row in enumerate(rows):
+                if int(row.get("tracker_id") or 0) != int(tracker_id):
+                    continue
 
-        # SQL Server DateTime columns commonly return naive datetimes.
-        # Use a naive UTC cutoff to avoid aware/naive comparison issues.
-        cutoff = datetime.utcnow() - timedelta(minutes=max_age_minutes)
-        query = query.filter(Detection.timestamp >= cutoff)
+                if location is not None and row.get("location") != location:
+                    continue
 
-        detection = query.order_by(desc(Detection.timestamp)).first()
+                recorded_at = _timestamp_value(row.get("timestamp"))
+                if recorded_at is None or recorded_at < cutoff:
+                    continue
 
-        if detection is None:
-            return None
+                matches.append((index, recorded_at))
 
-        registration = _clean_registration(registration_number)
-        if registration:
-            detection.registration_number = registration
+            if not matches:
+                return None
 
-        _apply_optional_fields(
-            detection,
-            vehicle_type=vehicle_type,
-            confidence=confidence,
-            overload_status=overload_status,
-            severity_score=severity_score,
-            location=location,
-            snapshot=snapshot,
-            latitude=latitude,
-            longitude=longitude,
-        )
+            latest_index = max(matches, key=lambda item: item[1])[0]
+            detection = rows[latest_index]
 
-        db.commit()
-        db.refresh(detection)
-        return detection
+            registration = _clean_registration(registration_number)
+            if registration:
+                detection["registration_number"] = registration
+
+            _apply_optional_fields(
+                detection,
+                vehicle_type=vehicle_type,
+                confidence=confidence,
+                overload_status=overload_status,
+                severity_score=severity_score,
+                location=location,
+                snapshot=snapshot,
+                latitude=latitude,
+                longitude=longitude,
+            )
+
+            # Refresh timestamp to keep this track's record current.
+            detection["timestamp"] = datetime.utcnow().isoformat()
+
+            _write_rows(rows)
+            return detection
 
     except Exception as exc:
-        db.rollback()
-        print(f"[DATABASE] Update detection failed: {exc}")
+        print(f"[CSV] Update detection failed: {exc}")
         raise
-
-    finally:
-        db.close()
 
 
 # ==========================================================
@@ -234,12 +342,7 @@ def save_or_update_detection(
     longitude: float = None,
 ):
     """
-    Save the first observation for a tracker, then update that record.
-
-    Call this from the live detection pipeline:
-      - First sighting: creates a row, even if registration is UNKNOWN.
-      - Later ANPR success: updates the same recent row with the plate.
-      - Later UNKNOWN OCR: preserves any previously recognised plate.
+    Create a record on first sighting, then update it for the same recent track.
     """
     existing = update_detection_by_tracker_id(
         tracker_id=tracker_id,
@@ -276,16 +379,13 @@ def save_or_update_detection(
 # ==========================================================
 
 def get_all_detections():
-    db: Session = SessionLocal()
-
-    try:
-        return (
-            db.query(Detection)
-            .order_by(desc(Detection.timestamp))
-            .all()
-        )
-    finally:
-        db.close()
+    """Return all detections, newest first."""
+    rows = _read_rows()
+    return sorted(
+        rows,
+        key=lambda row: _timestamp_value(row.get("timestamp")) or datetime.min,
+        reverse=True,
+    )
 
 
 # ==========================================================
@@ -293,45 +393,33 @@ def get_all_detections():
 # ==========================================================
 
 def get_latest_detection():
-    db: Session = SessionLocal()
+    """Return the latest detection in the dashboard response format."""
+    detections = get_all_detections()
 
-    try:
-        latest = (
-            db.query(Detection)
-            .order_by(desc(Detection.timestamp))
-            .first()
-        )
+    if not detections:
+        return {"vehicles": []}
 
-        if latest is None:
-            return {"vehicles": []}
+    latest = detections[0]
 
-        return {
-            "vehicles": [
-                {
-                    "id": latest.id,
-                    "tracker_id": latest.tracker_id,
-                    "vehicle_type": latest.vehicle_type,
-                    "registration_number": latest.registration_number,
-                    "confidence": latest.confidence,
-                    # The current Detection model has no plate_confidence column.
-                    "ocr_confidence": None,
-                    "severity_score": latest.severity_score,
-                    "overload_status": latest.overload_status,
-                    "location": latest.location,
-                    "snapshot": format_snapshot(latest.snapshot),
-                    "timestamp": (
-                        latest.timestamp.isoformat()
-                        if latest.timestamp is not None
-                        else None
-                    ),
-                    "latitude": latest.latitude,
-                    "longitude": latest.longitude,
-                }
-            ]
-        }
-
-    finally:
-        db.close()
+    return {
+        "vehicles": [
+            {
+                "id": latest.id,
+                "tracker_id": latest.tracker_id,
+                "vehicle_type": latest.vehicle_type,
+                "registration_number": latest.registration_number,
+                "confidence": latest.confidence,
+                "ocr_confidence": None,
+                "severity_score": latest.severity_score,
+                "overload_status": latest.overload_status,
+                "location": latest.location,
+                "snapshot": format_snapshot(latest.snapshot),
+                "timestamp": latest.timestamp or None,
+                "latitude": latest.latitude,
+                "longitude": latest.longitude,
+            }
+        ]
+    }
 
 
 # ==========================================================
@@ -339,38 +427,33 @@ def get_latest_detection():
 # ==========================================================
 
 def get_dashboard_stats():
-    db: Session = SessionLocal()
+    """Calculate dashboard totals from detections.csv."""
+    detections = get_all_detections()
 
-    try:
-        detections = db.query(Detection).all()
+    vehicle_types = [
+        (row.get("vehicle_type") or "").strip().lower()
+        for row in detections
+    ]
+    statuses = [
+        (row.get("overload_status") or "").strip().upper()
+        for row in detections
+    ]
 
-        vehicle_types = [
-            (d.vehicle_type or "").strip().lower()
-            for d in detections
-        ]
-        statuses = [
-            (d.overload_status or "").strip().upper()
-            for d in detections
-        ]
-
-        return {
-            "total_vehicles": len(detections),
-            "cars": vehicle_types.count("car"),
-            "trucks": vehicle_types.count("truck"),
-            "buses": vehicle_types.count("bus"),
-            "motorcycles": vehicle_types.count("motorcycle"),
-            "taxis": vehicle_types.count("taxi"),
-            "vans": vehicle_types.count("van"),
-            "pickups": vehicle_types.count("pickup"),
-            "warnings": statuses.count("WARNING"),
-            "overloaded": sum(
-                1 for status in statuses
-                if status in {"HIGH", "OVERLOADED"}
-            ),
-        }
-
-    finally:
-        db.close()
+    return {
+        "total_vehicles": len(detections),
+        "cars": vehicle_types.count("car"),
+        "trucks": vehicle_types.count("truck"),
+        "buses": vehicle_types.count("bus"),
+        "motorcycles": vehicle_types.count("motorcycle"),
+        "taxis": vehicle_types.count("taxi"),
+        "vans": vehicle_types.count("van"),
+        "pickups": vehicle_types.count("pickup"),
+        "warnings": statuses.count("WARNING"),
+        "overloaded": sum(
+            1 for status in statuses
+            if status in {"HIGH", "OVERLOADED"}
+        ),
+    }
 
 
 # ==========================================================
@@ -378,17 +461,11 @@ def get_dashboard_stats():
 # ==========================================================
 
 def get_alerts():
-    db: Session = SessionLocal()
-
-    try:
-        return (
-            db.query(Detection)
-            .filter(Detection.overload_status != "NORMAL")
-            .order_by(desc(Detection.timestamp))
-            .all()
-        )
-    finally:
-        db.close()
+    """Return all records whose status is not NORMAL."""
+    return [
+        row for row in get_all_detections()
+        if (row.get("overload_status") or "").strip().upper() != "NORMAL"
+    ]
 
 
 # ==========================================================
@@ -396,15 +473,16 @@ def get_alerts():
 # ==========================================================
 
 def clear_alerts():
-    db: Session = SessionLocal()
-
+    """Remove non-NORMAL detection records from detections.csv."""
     try:
-        deleted = (
-            db.query(Detection)
-            .filter(Detection.overload_status != "NORMAL")
-            .delete(synchronize_session=False)
-        )
-        db.commit()
+        with _CSV_LOCK:
+            rows = _read_rows()
+            remaining = [
+                row for row in rows
+                if (row.get("overload_status") or "").strip().upper() == "NORMAL"
+            ]
+            deleted = len(rows) - len(remaining)
+            _write_rows(remaining)
 
         return {
             "deleted_records": deleted,
@@ -412,12 +490,8 @@ def clear_alerts():
         }
 
     except Exception as exc:
-        db.rollback()
-        print(f"[DATABASE] Clear alerts failed: {exc}")
+        print(f"[CSV] Clear alerts failed: {exc}")
         raise
-
-    finally:
-        db.close()
 
 
 # ==========================================================
@@ -425,17 +499,13 @@ def clear_alerts():
 # ==========================================================
 
 def get_detections_by_vehicle(vehicle_type: str):
-    db: Session = SessionLocal()
+    """Return detections matching a vehicle type."""
+    requested_type = (vehicle_type or "").strip().lower()
 
-    try:
-        return (
-            db.query(Detection)
-            .filter(Detection.vehicle_type == vehicle_type)
-            .order_by(desc(Detection.timestamp))
-            .all()
-        )
-    finally:
-        db.close()
+    return [
+        row for row in get_all_detections()
+        if (row.get("vehicle_type") or "").strip().lower() == requested_type
+    ]
 
 
 # ==========================================================
@@ -443,13 +513,9 @@ def get_detections_by_vehicle(vehicle_type: str):
 # ==========================================================
 
 def get_detection_by_id(detection_id: int):
-    db: Session = SessionLocal()
+    """Return one detection by its CSV ID, or None."""
+    for row in _read_rows():
+        if row.id == int(detection_id):
+            return row
 
-    try:
-        return (
-            db.query(Detection)
-            .filter(Detection.id == detection_id)
-            .first()
-        )
-    finally:
-        db.close()
+    return None
