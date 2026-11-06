@@ -83,6 +83,22 @@ const getAssetUrl = (path) => {
 };
 
 
+// Keep backend status values consistent in the dashboard.
+const normaliseStatus = (value) => {
+  const status = String(value || "NORMAL").trim().toUpperCase();
+
+  if (["OVERLOAD", "OVERLOADED", "WARNING", "HIGH", "CRITICAL"].includes(status)) {
+    return { label: "OVERLOAD", className: "bg-red-600 text-white" };
+  }
+
+  if (["REVIEW_REQUIRED", "REVIEW", "INDETERMINATE", "UNKNOWN"].includes(status)) {
+    return { label: "REVIEW REQUIRED", className: "bg-amber-500 text-slate-950" };
+  }
+
+  return { label: "NORMAL", className: "bg-green-600 text-white" };
+};
+
+
 
 export default function Dashboard() {
 
@@ -100,15 +116,62 @@ export default function Dashboard() {
   const activeJob = useRef(null);
   const localMediaUrl = useRef(null);
   const mounted = useRef(true);
+  const cameraRetryTimer = useRef(null);
+  const cameraRetryCount = useRef(0);
+
+  // Declare state before effects/callbacks that read it.
+  const [mode, setMode] = useState("camera");
+  const [preview, setPreview] = useState(cameraFeed);
+  const [cameraStatus, setCameraStatus] = useState("connecting");
 
   useEffect(() => {
     mounted.current = true;
     return () => {
       mounted.current = false;
       activeJob.current?.abort();
+      if (cameraRetryTimer.current) clearTimeout(cameraRetryTimer.current);
       if (localMediaUrl.current) URL.revokeObjectURL(localMediaUrl.current);
     };
   }, []);
+
+  // Restart the MJPEG connection if the browser reports that the stream ended.
+  // Backoff prevents rapid reconnect loops when the camera/backend is unavailable.
+  const reconnectCamera = () => {
+    if (!mounted.current || mode !== "camera") return;
+    if (cameraRetryTimer.current) clearTimeout(cameraRetryTimer.current);
+    cameraRetryCount.current += 1;
+    const delay = Math.min(1000 * 2 ** (cameraRetryCount.current - 1), 10000);
+    setCameraStatus("reconnecting");
+    cameraRetryTimer.current = setTimeout(() => {
+      if (mounted.current && mode === "camera") {
+        setPreview(`${cameraFeed}${cameraFeed.includes("?") ? "&" : "?"}t=${Date.now()}`);
+      }
+    }, delay);
+  };
+
+  const handleCameraLoad = () => {
+    cameraRetryCount.current = 0;
+    setCameraStatus("connected");
+  };
+
+  const handleCameraError = () => {
+    setCameraStatus("disconnected");
+    reconnectCamera();
+  };
+
+  // Browsers may suspend image streams while a tab is in the background.
+  // Reopen the stream when the dashboard becomes visible again.
+  useEffect(() => {
+    const handleVisibility = () => {
+      if (document.visibilityState === "visible" && mode === "camera") {
+        if (cameraRetryTimer.current) clearTimeout(cameraRetryTimer.current);
+        setCameraStatus("reconnecting");
+        setPreview(`${cameraFeed}${cameraFeed.includes("?") ? "&" : "?"}t=${Date.now()}`);
+      }
+    };
+    document.addEventListener("visibilitychange", handleVisibility);
+    return () => document.removeEventListener("visibilitychange", handleVisibility);
+  }, [mode]);
 
   const cancelPreviousJob = () => {
     activeJob.current?.abort();
@@ -118,12 +181,6 @@ export default function Dashboard() {
     localMediaUrl.current = null;
     return controller;
   };
-
-
-
-  const [mode, setMode] = useState("camera");
-
-  const [preview, setPreview] = useState(cameraFeed);
 
 
 
@@ -157,14 +214,15 @@ export default function Dashboard() {
 
   const [processingVideo, setProcessingVideo] = useState(false);
   const [vehicles, setVehicles] = useState([]);
-  const [jobStatus, setJobStatus] = useState("idle");
+  const [jobStatus, setJobStatus] = useState("idle")
+ const [videoProgress, setVideoProgress] = useState(0);
   const [jobError, setJobError] = useState("");
 
 
 
   const [location, setLocation] = useState({
 
-    address: "Fetching GPS...",
+    address: " Block K, 2 Aubrey Matlala Street, Soshanguve Pretoria",
 
     latitude: null,
 
@@ -197,7 +255,7 @@ export default function Dashboard() {
         const gps = {
           latitude: coords.latitude,
           longitude: coords.longitude,
-          address: "Resolving address...",
+          address: " Block K, 2 Aubrey Matlala Street, Soshanguve Pretoria",
         };
 
         // Display coordinates immediately.
@@ -300,6 +358,7 @@ export default function Dashboard() {
     if (!file) return;
 
     const controller = cancelPreviousJob();
+    // Show the selected image immediately while the backend analyses it.
     const localPreview = URL.createObjectURL(file);
     localMediaUrl.current = localPreview;
     setMode("image");
@@ -349,10 +408,9 @@ export default function Dashboard() {
     if (!file) return;
 
     const controller = cancelPreviousJob();
-    const localPreview = URL.createObjectURL(file);
-    localMediaUrl.current = localPreview;
     setMode("video");
-    setVideoPreview(localPreview);
+    setVideoPreview("");
+    setVideoProgress(0);
     setVehicles([]);
     setJobError("");
     setJobStatus("uploading");
@@ -364,17 +422,47 @@ export default function Dashboard() {
       if (controller.signal.aborted || !mounted.current) return;
       setJobStatus(upload.status);
 
-      const result = await waitForJob(
-        upload.job_id,
-        (status) => {
-          if (!controller.signal.aborted && mounted.current) setJobStatus(status);
-        },
-        controller.signal
-      );
+      // Poll the job so the dashboard can begin playback as soon as the
+      // backend has finalized the annotated first-quarter preview.
+      let result = null;
+      while (!controller.signal.aborted && mounted.current) {
+        const response = await fetch(`${API_URL}/jobs/${upload.job_id}`, {
+          signal: controller.signal,
+          cache: "no-store",
+        });
+        if (!response.ok) {
+          throw new Error(`Unable to read processing status (${response.status})`);
+        }
 
-      if (controller.signal.aborted || !mounted.current) return;
-      if (result.processed_video) setVideoPreview(mediaUrl(result.processed_video));
+        const job = await response.json();
+        setJobStatus(job.status || "processing");
+        setVideoProgress(Number(job.progress || 0));
+
+        if (job.preview_video) {
+          const nextPreview = mediaUrl(job.preview_video);
+          setVideoPreview((current) =>
+            current.startsWith(nextPreview) ? current : `${nextPreview}?v=${Date.now()}`
+          );
+        }
+
+        if (job.status === "completed") {
+          result = job.result || {};
+          break;
+        }
+        if (job.status === "failed") {
+          throw new Error(job.error || "Video processing failed");
+        }
+
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+      }
+
+      if (controller.signal.aborted || !mounted.current || !result) return;
+      if (result.processed_video) {
+        const finalVideo = mediaUrl(result.processed_video);
+        setVideoPreview(`${finalVideo}?v=${Date.now()}`);
+      }
       setVehicles(result.vehicles || []);
+      setVideoProgress(100);
       setJobStatus("completed");
       await loadDashboard();
     } catch (err) {
@@ -399,8 +487,10 @@ export default function Dashboard() {
     setJobStatus("idle");
     setJobError("");
     setMode("camera");
-
-    setPreview(`${cameraFeed}?${Date.now()}`);
+    cameraRetryCount.current = 0;
+    if (cameraRetryTimer.current) clearTimeout(cameraRetryTimer.current);
+    setCameraStatus("connecting");
+    setPreview(`${cameraFeed}${cameraFeed.includes("?") ? "&" : "?"}t=${Date.now()}`);
 
   };
 
@@ -452,7 +542,7 @@ export default function Dashboard() {
 
           <h1 className="text-4xl font-bold text-white">Vehicle Overload Detection Dashboard</h1>
 
-          <p className="mt-2 text-slate-400">YOLOv11 • OCR • ByteTrack • SQL Server • FastAPI</p>
+          <p className="mt-2 text-slate-400">YOLOv11 • OCR • ByteTrack • CSV Records • FastAPI</p>
 
         </div>
 
@@ -536,7 +626,7 @@ export default function Dashboard() {
 
               <span className="h-2.5 w-2.5 animate-pulse rounded-full bg-green-400"></span>
 
-              LIVE
+              {cameraStatus === "connected" ? "LIVE" : cameraStatus.toUpperCase()}
 
             </div>
 
@@ -552,9 +642,15 @@ export default function Dashboard() {
 
               <img
 
+                key={preview}
+
                 src={preview}
 
                 alt="Live Camera"
+
+                onLoad={handleCameraLoad}
+
+                onError={handleCameraError}
 
                 className="w-full h-full object-contain"
 
@@ -609,9 +705,19 @@ export default function Dashboard() {
 
 
             {/* Non-blocking status: preview remains visible */}
-            {mode !== "camera" && ["uploading", "queued", "processing"].includes(jobStatus) && (
+            {mode === "video" && ["uploading", "queued", "processing"].includes(jobStatus) && (
+              <div className="absolute top-3 right-3 pointer-events-none rounded-lg bg-slate-950/90 px-4 py-3 text-sm text-green-300 shadow">
+                <div>{videoPreview ? "Annotated preview available" : "Processing video before playback..."}</div>
+                <div className="mt-1">{videoProgress}% processed</div>
+                <div className="mt-2 h-1.5 w-48 overflow-hidden rounded-full bg-slate-700">
+                  <div className="h-full rounded-full bg-green-400 transition-all" style={{ width: `${videoProgress}%` }} />
+                </div>
+                {!videoPreview && <div className="mt-1 text-xs text-slate-300">Playback starts at 25% with bounding boxes.</div>}
+              </div>
+            )}
+            {mode === "image" && ["uploading", "queued", "processing"].includes(jobStatus) && (
               <div className="absolute top-3 right-3 pointer-events-none rounded-lg bg-slate-950/85 px-4 py-2 text-sm text-green-300 shadow">
-                {jobStatus === "uploading" ? "Uploading media..." : "Analysing vehicles, plates and overload..."}
+                {jobStatus === "uploading" ? "Uploading image..." : "Analysing image..."}
               </div>
             )}
             {mode !== "camera" && jobError && (
@@ -784,7 +890,7 @@ export default function Dashboard() {
 
             <h2 className="text-xl font-semibold">Detection History</h2>
 
-            <p className="text-sm text-slate-400">Existing records pulled from SQL Server</p>
+            <p className="text-sm text-slate-400">Detection records loaded from detections.csv</p>
 
           </div>
 
@@ -858,11 +964,14 @@ export default function Dashboard() {
 
                     <td className="px-4 py-3">
 
-                      <span className={`px-2 py-1 rounded-full text-xs font-semibold ${item.overload_status === "OVERLOADED" ? "bg-red-600 text-white" : "bg-green-600 text-white"}`}>
-
-                        {item.overload_status || "NORMAL"}
-
-                      </span>
+                      {(() => {
+                        const status = normaliseStatus(item.overload_status);
+                        return (
+                          <span className={`px-2 py-1 rounded-full text-xs font-semibold ${status.className}`}>
+                            {status.label}
+                          </span>
+                        );
+                      })()}
 
                     </td>
 
@@ -876,7 +985,7 @@ export default function Dashboard() {
 
                     <td className="px-4 py-3 text-center">
                       {(() => {
-                        const snapshotPath = item.snapshot || item.detections?.find((det) => det?.snapshot)?.snapshot;
+                        const snapshotPath = item.snapshot;
                         return snapshotPath ? (
                           <img
                             src={getAssetUrl(snapshotPath)}
@@ -895,7 +1004,7 @@ export default function Dashboard() {
                         type="button"
                         onClick={() => setSelectedVehicle({
                           ...item,
-                          snapshot: item.snapshot || item.detections?.find((det) => det?.snapshot)?.snapshot || null,
+                          snapshot: item.snapshot || null,
                         })}
                         className="inline-flex items-center gap-2 rounded-lg border border-cyan-500/40 bg-cyan-500/10 px-3 py-2 text-xs font-semibold text-cyan-300 transition hover:border-cyan-400 hover:bg-cyan-500/20 focus:outline-none focus:ring-2 focus:ring-cyan-400"
                       >
@@ -935,7 +1044,7 @@ export default function Dashboard() {
           >
             <header className="flex items-center justify-between border-b border-slate-700 px-5 py-4">
               <div>
-                <h2 id="vehicle-snapshot-title" className="text-lg font-bold text-white">Vehicle snapshot</h2>
+                <h2 id="vehicle-snapshot-title" className="text-lg font-bold text-white">Summary</h2>
                 <p className="text-xs text-slate-400">Tracker #{selectedVehicle.tracker_id ?? selectedVehicle.id ?? "N/A"}</p>
               </div>
               <button
@@ -964,33 +1073,80 @@ export default function Dashboard() {
                 )}
               </div>
 
-              <div className="space-y-4">
-                <h3 className="text-sm font-semibold uppercase tracking-wider text-cyan-300">Detection details</h3>
-                {[
-                  ["Vehicle", selectedVehicle.vehicle_type || "Unknown"],
-                  ["Registration", selectedVehicle.registration_number || "UNKNOWN"],
-                  ["Confidence", `${Number(selectedVehicle.confidence ?? 0).toFixed(2)}%`],
-                  ["Status", selectedVehicle.overload_status || "NORMAL"],
-                  ["Location", selectedVehicle.location || "Unknown"],
-                  ["Detected at", selectedVehicle.timestamp ? new Date(selectedVehicle.timestamp).toLocaleString("en-ZA") : "N/A"],
-                ].map(([label, value]) => (
-                  <div key={label} className="border-b border-slate-800 pb-3">
-                    <p className="text-xs text-slate-500">{label}</p>
-                    <p className="mt-1 break-words text-sm text-white">{value}</p>
-                  </div>
-                ))}
-                {selectedVehicle.snapshot && (
-                  <a
-                    href={getAssetUrl(selectedVehicle.snapshot)}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="inline-flex items-center gap-2 rounded-lg bg-cyan-600 px-4 py-2 text-sm font-semibold text-white transition hover:bg-cyan-500"
-                  >
-                    <ExternalLink size={15} />
-                    Open original image
-                  </a>
-                )}
-              </div>
+<div className="space-y-4">
+  <h3 className="text-sm font-semibold uppercase tracking-wider text-cyan-300">
+    Detection details
+  </h3>
+
+  {[
+    ["Vehicle", selectedVehicle.vehicle_type || "Unknown"],
+    ["Registration", selectedVehicle.registration_number || "UNKNOWN"],
+    ["Confidence", `${Number(selectedVehicle.confidence ?? 0).toFixed(2)}%`],
+    ["Status", selectedVehicle.overload_status || "NORMAL"],
+    ["Location", selectedVehicle.location || "Unknown"],
+    [
+      "Detected at",
+      selectedVehicle.timestamp
+        ? new Date(selectedVehicle.timestamp).toLocaleString("en-ZA")
+        : "N/A",
+    ],
+  ].map(([label, value]) => (
+    <div key={label} className="border-b border-slate-800 pb-3">
+      <p className="text-xs text-slate-500">{label}</p>
+      <p className="mt-1 break-words text-sm text-white">{value}</p>
+    </div>
+  ))}
+
+  {/* NUMBER PLATE SNIPPET */}
+  <div className="space-y-2 border-b border-slate-800 pb-4">
+    <h4 className="text-xs font-semibold uppercase tracking-wider text-cyan-300">
+      Captured number plate
+    </h4>
+
+    {selectedVehicle.plate_snippet ? (
+      <>
+        <div className="overflow-hidden rounded-lg border border-cyan-500/30 bg-slate-950 p-2">
+          <img
+            src={getAssetUrl(selectedVehicle.plate_snippet)}
+            alt={`Number plate for tracker ${selectedVehicle.tracker_id || ""}`}
+            className="max-h-32 w-full object-contain"
+            onError={(e) => {
+              e.currentTarget.style.display = "none";
+            }}
+          />
+        </div>
+
+        <a
+          href={getAssetUrl(selectedVehicle.plate_snippet)}
+          target="_blank"
+          rel="noreferrer"
+          className="inline-flex items-center gap-2 rounded-lg bg-cyan-600 px-3 py-2 text-xs font-semibold text-white hover:bg-cyan-500"
+        >
+          <ExternalLink size={14} />
+          Open plate snippet
+        </a>
+      </>
+    ) : (
+      <p className="rounded-lg bg-slate-900 p-3 text-xs text-amber-400">
+        No plate snippet captured yet. Registration requires review.
+      </p>
+    )}
+  </div>
+
+  {/* ORIGINAL VEHICLE SNAPSHOT */}
+  {selectedVehicle.snapshot && (
+    <a
+      href={getAssetUrl(selectedVehicle.snapshot)}
+      target="_blank"
+      rel="noreferrer"
+      className="inline-flex items-center gap-2 rounded-lg bg-cyan-600 px-4 py-2 text-sm font-semibold text-white transition hover:bg-cyan-500"
+    >
+      <ExternalLink size={15} />
+      Open original vehicle image
+    </a>
+  )}
+</div>
+
             </div>
           </section>
         </div>

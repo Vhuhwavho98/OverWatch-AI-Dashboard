@@ -1,6 +1,10 @@
 
 from __future__ import annotations
 import logging
+import csv
+import inspect
+import threading
+from datetime import datetime, timedelta
 import uuid
 from pathlib import Path
 import cv2
@@ -8,42 +12,355 @@ import numpy as np
 import torch
 from ultralytics import YOLO
 import re
+import time
 from services.ocr_service import detect_plate
 from database.repository import save_or_update_detection, update_detection_by_tracker_id
 
 logger = logging.getLogger(__name__)
 
+
+# ============================================================
+# CSV MIRROR PERSISTENCE
+# Writes the same vehicle records to backend/detections.csv
+# while retaining the existing SQL Server persistence.
+# ============================================================
+
+CSV_FILE = Path(__file__).resolve().parents[1] / "detections.csv"
+CSV_FIELDS = [
+    "id", "tracker_id", "vehicle_type", "registration_number",
+    "confidence", "overload_status", "severity_score", "location",
+    "snapshot", "plate_snippet", "timestamp", "latitude", "longitude",
+]
+_CSV_LOCK = threading.RLock()
+
+
+def _csv_read_rows():
+    CSV_FILE.parent.mkdir(parents=True, exist_ok=True)
+    if not CSV_FILE.exists() or CSV_FILE.stat().st_size == 0:
+        with CSV_FILE.open("w", newline="", encoding="utf-8-sig") as f:
+            csv.DictWriter(f, fieldnames=CSV_FIELDS).writeheader()
+
+    with CSV_FILE.open("r", newline="", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        return list(reader)
+
+
+def _csv_write_rows(rows):
+    temporary = CSV_FILE.with_suffix(".csv.tmp")
+    with temporary.open("w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({key: row.get(key, "") for key in CSV_FIELDS})
+    temporary.replace(CSV_FILE)
+
+
+def _csv_upsert_vehicle(
+    tracker_id,
+    vehicle_type,
+    registration_number,
+    confidence,
+    overload_status,
+    severity_score,
+    location,
+    snapshot,
+    plate_snippet=None,
+    latitude=None,
+    longitude=None,
+):
+    """Create one CSV row per recent tracker/location, otherwise update it."""
+    try:
+        with _CSV_LOCK:
+            rows = _csv_read_rows()
+            now = datetime.utcnow()
+            cutoff = now - timedelta(minutes=5)
+            match_index = None
+
+            for index, row in enumerate(rows):
+                try:
+                    same_tracker = int(row.get("tracker_id") or -1) == int(tracker_id)
+                except (TypeError, ValueError):
+                    same_tracker = False
+
+                if not same_tracker or row.get("location", "") != (location or ""):
+                    continue
+
+                try:
+                    recorded = datetime.fromisoformat(
+                        (row.get("timestamp") or "").replace("Z", "+00:00")
+                    ).replace(tzinfo=None)
+                except (TypeError, ValueError):
+                    continue
+
+                if recorded >= cutoff:
+                    match_index = index
+                    break
+
+            registration = str(registration_number or "UNKNOWN").strip().upper()
+            if registration in {"", "UNKNOWN", "N/A", "NONE"}:
+                registration = None
+
+            if match_index is None:
+                next_id = max(
+                    (int(row.get("id") or 0) for row in rows),
+                    default=0,
+                ) + 1
+                record = {
+                    "id": next_id,
+                    "tracker_id": int(tracker_id),
+                    "vehicle_type": vehicle_type or "Unknown",
+                    "registration_number": registration or "UNKNOWN",
+                    "confidence": float(confidence or 0.0),
+                    "overload_status": overload_status or "INDETERMINATE",
+                    "severity_score": float(severity_score or 0),
+                    "location": location or "Unknown",
+                    "snapshot": snapshot or "",
+                    "plate_snippet": plate_snippet or "",
+                    "timestamp": now.isoformat(timespec="seconds"),
+                    "latitude": latitude if latitude is not None else "",
+                    "longitude": longitude if longitude is not None else "",
+                }
+                rows.append(record)
+            else:
+                record = rows[match_index]
+                record.update({
+                    "vehicle_type": vehicle_type or record.get("vehicle_type", "Unknown"),
+                    "confidence": float(confidence or 0.0),
+                    "overload_status": overload_status or record.get("overload_status", "INDETERMINATE"),
+                    "severity_score": float(severity_score or 0),
+                    "location": location or record.get("location", " Block K, 2 Aubrey Matlala Street, Soshanguve Pretoria"),
+                    "snapshot": snapshot or record.get("snapshot", ""),
+                    "plate_snippet": plate_snippet or record.get("plate_snippet", ""),
+                    "timestamp": now.isoformat(timespec="seconds"),
+                })
+                if registration:
+                    record["registration_number"] = registration
+
+            _csv_write_rows(rows)
+            logger.info(
+                "[CSV] Saved/updated tracker_id=%s at %s -> %s",
+                tracker_id, CSV_FILE, CSV_FILE.exists()
+            )
+    except Exception:
+        logger.exception("[CSV] Failed to save tracker_id=%s to %s", tracker_id, CSV_FILE)
+        raise
+
+
+def _csv_update_registration(tracker_id, registration_number, location, plate_snippet=None):
+    """
+    Update the newest matching CSV row when ANPR succeeds later.
+    Do not expire the row after five minutes: a vehicle can remain tracked
+    longer than that, and a delayed OCR result must still replace UNKNOWN.
+    """
+    registration = re.sub(r"[^A-Z0-9]", "", str(registration_number or "").upper())
+    if not registration or registration in {"UNKNOWN", "OCRNOTREADABLE"}:
+        return False
+
+    with _CSV_LOCK:
+        rows = _csv_read_rows()
+        matches = []
+
+        for index, row in enumerate(rows):
+            try:
+                same_tracker = int(row.get("tracker_id") or -1) == int(tracker_id)
+            except (TypeError, ValueError):
+                same_tracker = False
+
+            if not same_tracker:
+                continue
+
+            # Prefer exact location match, but do not discard a valid ANPR
+            # update solely because GPS text changed slightly between frames.
+            row_location = (row.get("location") or " Block K, 2 Aubrey Matlala Street, Soshanguve Pretoria").strip()
+            requested_location = (location or "").strip()
+            location_match = (
+                not requested_location
+                or not row_location
+                or row_location == requested_location
+            )
+
+            try:
+                recorded = datetime.fromisoformat(
+                    (row.get("timestamp") or "").replace("Z", "+00:00")
+                ).replace(tzinfo=None)
+            except (TypeError, ValueError):
+                recorded = datetime.min
+
+            matches.append((index, recorded, location_match))
+
+        if not matches:
+            logger.warning(
+                "[CSV] No row found for ANPR update tracker_id=%s plate=%s",
+                tracker_id, registration,
+            )
+            return False
+
+        # Select newest matching tracker row; prefer matching location where
+        # possible. This prevents an old UNKNOWN value being left untouched.
+        preferred = [item for item in matches if item[2]]
+        candidates = preferred or matches
+        index = max(candidates, key=lambda item: item[1])[0]
+
+        rows[index]["registration_number"] = registration
+        if plate_snippet:
+            rows[index]["plate_snippet"] = plate_snippet
+        _csv_write_rows(rows)
+
+        logger.info(
+            "[CSV] ANPR registration updated tracker_id=%s registration=%s row_id=%s",
+            tracker_id, registration, rows[index].get("id"),
+        )
+        return True
+
+
+
+def _csv_update_plate_snippet(tracker_id, plate_snippet, location=None):
+    """Attach a saved plate crop to the existing tracker row, even if OCR needs review."""
+    if not plate_snippet:
+        return False
+    with _CSV_LOCK:
+        rows = _csv_read_rows()
+        matches = []
+        for index, row in enumerate(rows):
+            try:
+                same_tracker = int(row.get("tracker_id") or -1) == int(tracker_id)
+            except (TypeError, ValueError):
+                same_tracker = False
+            if not same_tracker:
+                continue
+            location_match = (
+                not location
+                or not row.get("location")
+                or row.get("location") == location
+            )
+            matches.append((index, location_match))
+        if not matches:
+            logger.warning(
+                "[CSV] No row found for plate snippet tracker_id=%s", tracker_id
+            )
+            return False
+        preferred = [item for item in matches if item[1]]
+        index = (preferred or matches)[-1][0]
+        rows[index]["plate_snippet"] = plate_snippet
+        _csv_write_rows(rows)
+        logger.info(
+            "[CSV] Plate snippet linked tracker_id=%s snippet=%s",
+            tracker_id, plate_snippet,
+        )
+        return True
+
+
 BASE_DIR = Path(__file__).resolve().parent.parent
-MODEL_PATH = BASE_DIR / "models" / "yolo11n.pt"
+MODEL_DIR = BASE_DIR / "models"
+
+# Prefer exported NCNN models for Raspberry Pi / CPU deployment.
+# Fall back to the original .pt files if an NCNN export is unavailable.
+VEHICLE_NCNN_PATH = MODEL_DIR / "yolo11n_ncnn_model"
+SPECIAL_NCNN_PATH = MODEL_DIR / "yolo26n_ncnn_model"
+VEHICLE_PT_PATH = MODEL_DIR / "yolo11n.pt"
+SPECIAL_PT_PATH = MODEL_DIR / "yolo26n.pt"
+
+VEHICLE_MODEL_PATH = (
+    VEHICLE_NCNN_PATH if (VEHICLE_NCNN_PATH / "model.ncnn.param").is_file()
+    else VEHICLE_PT_PATH
+)
+CARGO_PLATE_MODEL_PATH = (
+    SPECIAL_NCNN_PATH if (SPECIAL_NCNN_PATH / "model.ncnn.param").is_file()
+    else SPECIAL_PT_PATH
+)
+
 UPLOAD_DIR = BASE_DIR / "uploads"
 IMAGE_DIR = UPLOAD_DIR / "images"
 VIDEO_DIR = UPLOAD_DIR / "videos"
 SNAPSHOT_DIR = UPLOAD_DIR / "snapshots"
+PLATE_DIR = UPLOAD_DIR / "plates"
 
-for directory in (IMAGE_DIR, VIDEO_DIR, SNAPSHOT_DIR):
+for directory in (IMAGE_DIR, VIDEO_DIR, SNAPSHOT_DIR, PLATE_DIR):
     directory.mkdir(parents=True, exist_ok=True)
 
-if not MODEL_PATH.is_file():
-    raise FileNotFoundError(f"YOLO model missing: {MODEL_PATH}")
+for model_path in (VEHICLE_MODEL_PATH, CARGO_PLATE_MODEL_PATH):
+    exists = (model_path / "model.ncnn.param").is_file() if model_path.is_dir() else model_path.is_file()
+    if not exists:
+        raise FileNotFoundError(f"Required YOLO model missing: {model_path}")
 
-model = YOLO(str(MODEL_PATH))
+vehicle_model = YOLO(str(VEHICLE_MODEL_PATH))
+cargo_plate_model = YOLO(str(CARGO_PLATE_MODEL_PATH))
 DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
+VEHICLE_IS_NCNN = VEHICLE_MODEL_PATH.is_dir()
+SPECIAL_IS_NCNN = CARGO_PLATE_MODEL_PATH.is_dir()
+
+
+def _normalise_names(names):
+    if isinstance(names, dict):
+        return {int(k): str(v).strip().lower() for k, v in names.items()}
+    return {i: str(v).strip().lower() for i, v in enumerate(names)}
+
+
+VEHICLE_NAMES = _normalise_names(vehicle_model.names)
+SPECIAL_NAMES = _normalise_names(cargo_plate_model.names)
+
+CARGO_CLASS_ALIASES = {
+    "cargo", "load", "luggage", "roof_load", "roof cargo",
+    "cargo_load", "loaded_goods", "stacked_load",
+    "tyre_load", "tire_load", "freight", "parcel", "baggage",
+}
+CARGO_CLASS_AVAILABLE = any(
+    name in CARGO_CLASS_ALIASES
+    or any(token in name for token in (
+        "cargo_load", "loaded_goods", "stacked_load",
+        "tyre_load", "tire_load", "roof_load",
+    ))
+    for name in SPECIAL_NAMES.values()
+)
 
 VEHICLE_CLASS_IDS = [1, 2, 3, 5, 7]
 
 VEHICLE_CLASSES = {
     "bicycle",
-    "car",
     "motorcycle",
+    "car",
+    "pickup",
+    "minibus",
+    "midibus",
     "bus",
     "truck",
 }
 
+logger.info("YOLO11 vehicle classes: %s", VEHICLE_NAMES)
+logger.info("YOLO26 cargo/plate classes: %s", SPECIAL_NAMES)
+logger.info(
+    "YOLO26 cargo-class capability: %s",
+    "AVAILABLE" if CARGO_CLASS_AVAILABLE else "MISSING - cargo risk cannot be positively classified by class",
+)
+logger.info("Inference device: %s", DEVICE)
+logger.info("YOLO11 backend: %s", "NCNN" if VEHICLE_IS_NCNN else "PyTorch")
+logger.info("YOLO26 backend: %s", "NCNN" if SPECIAL_IS_NCNN else "PyTorch")
+
+print("\n========== OVERWATCH AI MODELS ==========")
+print("Vehicle model:", VEHICLE_MODEL_PATH)
+print("Vehicle classes:", VEHICLE_NAMES)
+print("Cargo/plate model:", CARGO_PLATE_MODEL_PATH)
+print("Cargo/plate classes:", SPECIAL_NAMES)
+print("Cargo class available:", CARGO_CLASS_AVAILABLE)
+print("Vehicle class IDs:", VEHICLE_CLASS_IDS)
+print("Inference device:", DEVICE)
+print("Vehicle backend:", "NCNN" if VEHICLE_IS_NCNN else "PyTorch")
+print("Specialised backend:", "NCNN" if SPECIAL_IS_NCNN else "PyTorch")
+print("=========================================\n")
+
 # Conservative speed/accuracy defaults; adjust only after testing.
-YOLO_IMAGE_SIZE = 640
-YOLO_CONFIDENCE = 0.40
+YOLO_IMAGE_SIZE = 960  # Larger inference size improves distant/small vehicle detection in road videos.
+SPECIAL_IMAGE_SIZE = 416
+YOLO_CONFIDENCE = 0.15  # Keep lower-confidence proposals for display; saving still uses MIN_CONFIDENCE.
 YOLO_IOU = 0.50
-MAX_DETECTIONS = 30
+MAX_DETECTIONS = 50
+SPECIAL_CONFIDENCE = 0.25
+SPECIAL_MAX_DETECTIONS = 20
+# Run the specialised model every N frames per tracked vehicle; reuse mapped
+# detections between runs to reduce CPU load without skipping vehicle tracking.
+SPECIAL_INFERENCE_INTERVAL = 3
+SPECIAL_CACHE_MAX_AGE = 12
+PERFORMANCE_LOG_INTERVAL = 60
 
 DETECTION_POLYGON = np.array(
     [[20, 90], [1260, 90], [1235, 700], [40, 700]], dtype=np.int32
@@ -51,7 +368,7 @@ DETECTION_POLYGON = np.array(
 REFERENCE_WIDTH, REFERENCE_HEIGHT = 1280, 720
 FRAME_MARGIN_FRACTION = 0.025
 STABLE_FRAMES = 4
-MIN_CONFIDENCE = 0.40
+MIN_CONFIDENCE = 0.25
 MAX_OCR_ATTEMPTS = 8
 OCR_RETRY_INTERVAL = 12
 
@@ -92,117 +409,243 @@ def _visibility_reason(box, polygon, frame_w, frame_h):
     return None
 
 
-def assess_cargo_risk(vehicle_crop, vehicle_type="car"):
-    """Conservative OpenCV cargo screening; never estimates actual weight."""
+def assess_cargo_risk(
+    vehicle_crop,
+    vehicle_type="car",
+    specialised_regions=None,
+    vehicle_box=None,
+):
+    """
+    Screen for visibly unsafe cargo protruding above or beyond a vehicle.
+
+    YOLO26 must detect the trained 'cargo' class. The cargo box must also be
+    spatially associated with this vehicle and extend beyond its detected
+    body box. This is a visual risk indicator, not a measurement of mass.
+    """
     result = {
         "cargo_risk_score": 0,
-        "cargo_risk_level": "NO_VISUAL_INDICATOR",
+        "cargo_risk_level": "NORMAL",
         "cargo_indicators": [],
-        "cargo_assessment_method": "opencv_heuristic_v1",
+        "cargo_assessment_method": "cargo_detection_plus_vehicle_box_geometry",
+        "cargo_model_status": "NO_CARGO_DETECTED",
+        "cargo_candidate_count": 0,
     }
+
+    # Do not silently call a vehicle NORMAL if the loaded specialised model
+    # has no cargo/load class in its taxonomy. That would be a false-safe
+    # result: a standard COCO detector cannot positively identify arbitrary
+    # cargo such as tarpaulin-covered freight.
+    if not CARGO_CLASS_AVAILABLE:
+        result.update(
+            cargo_risk_level="UNKNOWN",
+            cargo_model_status="MODEL_HAS_NO_CARGO_CLASS",
+            cargo_assessment_method="UNSUPPORTED_MODEL_CLASS_TAXONOMY",
+        )
+        return result
+
     if (vehicle_crop is None or not isinstance(vehicle_crop, np.ndarray)
             or vehicle_crop.size == 0 or vehicle_crop.ndim < 2):
-        result.update(cargo_risk_level="NOT_ASSESSED",
-                      cargo_indicators=["INVALID_VEHICLE_CROP"])
+        result.update(cargo_risk_level="UNKNOWN",
+                      cargo_model_status="INVALID_VEHICLE_CROP")
         return result
 
-    h, w = vehicle_crop.shape[:2]
-    if h < 50 or w < 50:
-        result.update(cargo_risk_level="NOT_ASSESSED",
-                      cargo_indicators=["VEHICLE_CROP_TOO_SMALL"])
+    crop_h, crop_w = vehicle_crop.shape[:2]
+    if crop_h < 30 or crop_w < 30 or not vehicle_box:
+        result.update(cargo_risk_level="UNKNOWN",
+                      cargo_model_status="INVALID_VEHICLE_GEOMETRY")
         return result
 
-    upper = vehicle_crop[:max(1, int(h * 0.42)), :]
-    gray = cv2.cvtColor(upper, cv2.COLOR_BGR2GRAY) if upper.ndim == 3 else upper
-    gray = cv2.GaussianBlur(gray, (5, 5), 0)
-    edges = cv2.Canny(gray, 55, 145)
-    edge_density = float(np.count_nonzero(edges)) / float(edges.size)
-    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    upper_area = max(1, upper.shape[0] * upper.shape[1])
-    significant = []
-    for contour in contours:
-        area = cv2.contourArea(contour)
-        if area < upper_area * 0.008:
+    vx1, vy1, vx2, vy2 = map(float, vehicle_box)
+    vehicle_w = max(1.0, vx2 - vx1)
+    vehicle_h = max(1.0, vy2 - vy1)
+
+    # A cargo box can sit partly ABOVE the vehicle box, so do not require
+    # its centre to be inside the vehicle rectangle.
+    candidates = []
+    for region in specialised_regions or []:
+        name = str(region.get("class_name", "")).strip().lower()
+        confidence = float(region.get("confidence", 0.0))
+        box = region.get("box")
+        cargo_class = (
+            name in CARGO_CLASS_ALIASES
+            or any(token in name for token in (
+                "cargo_load", "loaded_goods", "stacked_load",
+                "tyre_load", "tire_load", "roof_load",
+            ))
+        )
+        if not cargo_class:
             continue
-        x, y, cw, ch = cv2.boundingRect(contour)
-        if ch >= max(8, int(upper.shape[0] * 0.12)):
-            significant.append((area, x, y, cw, ch))
+        if confidence < 0.35 or not box or len(box) != 4:
+            continue
 
-    score, indicators = 0, []
-    # Heuristic indicators only; thresholds require dataset validation.
-    if edge_density >= 0.105:
-        score += 25
-        indicators.append("HIGH_VISUAL_COMPLEXITY_IN_UPPER_REGION")
-    if len(significant) >= 3:
-        score += 25
-        indicators.append("MULTIPLE_LARGE_STRUCTURES_IN_UPPER_REGION")
-    if significant and max(item[4] for item in significant) >= upper.shape[0] * 0.45:
-        score += 20
-        indicators.append("VERTICALLY_EXTENDED_UPPER_STRUCTURE")
+        cx1, cy1, cx2, cy2 = map(float, box)
+        if cx2 <= cx1 or cy2 <= cy1:
+            continue
 
-    score = min(100, score)
-    result.update(
-        cargo_risk_score=score,
-        cargo_risk_level="REVIEW_REQUIRED" if score >= 25 else "NO_VISUAL_INDICATOR",
-        cargo_indicators=indicators,
-        cargo_edge_density=round(edge_density, 4),
-        cargo_candidate_regions=len(significant),
-    )
+        # Require meaningful horizontal overlap with the vehicle body.
+        overlap_w = max(0.0, min(vx2, cx2) - max(vx1, cx1))
+        cargo_w = max(1.0, cx2 - cx1)
+        overlap_ratio = overlap_w / cargo_w
+        horizontal_near = (
+            cx2 >= vx1 - 0.12 * vehicle_w
+            and cx1 <= vx2 + 0.12 * vehicle_w
+        )
+        if not horizontal_near or overlap_ratio < 0.25:
+            continue
+
+        # Cargo above the roof must touch/overlap the top region of the
+        # vehicle box. This rejects signs, people and background objects.
+        vertical_gap = vy1 - cy2
+        roof_attached = (
+            cy1 < vy1
+            and vertical_gap <= 0.12 * vehicle_h
+            and vertical_gap >= -0.10 * vehicle_h
+        )
+
+        # Side protrusion: cargo overlaps the vehicle vertically but extends
+        # clearly past either side of the vehicle body.
+        vertical_overlap = max(0.0, min(vy2, cy2) - max(vy1, cy1))
+        side_extension = (
+            vertical_overlap >= 0.20 * vehicle_h
+            and (
+                cx1 < vx1 - 0.08 * vehicle_w
+                or cx2 > vx2 + 0.08 * vehicle_w
+            )
+        )
+
+        if roof_attached or side_extension:
+            candidates.append({
+                "confidence": confidence,
+                "roof_protrusion": roof_attached,
+                "side_protrusion": side_extension,
+                "box": [int(cx1), int(cy1), int(cx2), int(cy2)],
+            })
+
+    result["cargo_candidate_count"] = len(candidates)
+    if candidates:
+        result["cargo_risk_score"] = min(
+            100, int(round(max(c["confidence"] for c in candidates) * 100))
+        )
+        result["cargo_risk_level"] = "WARNING"
+        result["cargo_model_status"] = "VISIBLE_CARGO_PROTRUSION"
+        if any(c["roof_protrusion"] for c in candidates):
+            result["cargo_indicators"].append("CARGO_PROTRUDING_ABOVE_ROOF")
+        if any(c["side_protrusion"] for c in candidates):
+            result["cargo_indicators"].append("CARGO_PROTRUDING_BEYOND_SIDE")
+        result["cargo_regions"] = candidates
+
     return result
 
 
 def classify_overload(vehicle_type, width, height, cargo_assessment=None):
-    """Map visual screening to status; NORMAL is not proof of legal loading."""
-    if not cargo_assessment or cargo_assessment.get("cargo_risk_level") == "NOT_ASSESSED":
+    """Classify only what the cargo model can support; avoid false-safe output."""
+    if not cargo_assessment:
         return "REVIEW_REQUIRED"
-    if cargo_assessment.get("cargo_risk_level") == "REVIEW_REQUIRED":
+    level = str(cargo_assessment.get("cargo_risk_level", "UNKNOWN")).upper()
+    if level == "WARNING":
         return "WARNING"
+    if level in {"UNKNOWN", "INDETERMINATE"}:
+        return "REVIEW_REQUIRED"
     return "NORMAL"
 
-def _read_plate(crop):
+
+def _read_plate(
+    crop,
+    plate_bbox=None,
+    plate_detection_confidence=0.0,
+    tracker_id=None,
+):
+    """Run ANPR and save the localized plate crop against its vehicle track."""
     if crop is None or not isinstance(crop, np.ndarray) or crop.size == 0:
-        return "UNKNOWN", 0.0, None, "OCR_FAILED"
+        return "UNKNOWN", 0.0, None, "OCR_FAILED", None
 
     try:
-        result = detect_plate(crop, debug=True)
-        if not isinstance(result, dict) or not result:
-            return "UNKNOWN", 0.0, None, "NO_PLATE_BOX"
+        # Pass the YOLO26 plate candidate when the installed OCR service
+        # supports it. The OCR service also scans the entire vehicle crop at
+        # multiple sizes, so front and rear plates are both considered.
+        # Signature filtering keeps compatibility with older OCR versions.
+        try:
+            accepted_parameters = inspect.signature(detect_plate).parameters
+        except (TypeError, ValueError):
+            accepted_parameters = {}
 
-        raw_registration = str(result.get("registration") or "").strip().upper()
+        ocr_kwargs = {"debug": True}
+        if "plate_bbox" in accepted_parameters:
+            ocr_kwargs["plate_bbox"] = plate_bbox
+        if "plate_detection_confidence" in accepted_parameters:
+            ocr_kwargs["plate_detection_confidence"] = plate_detection_confidence
+        result = detect_plate(crop, **ocr_kwargs)
+        if not isinstance(result, dict) or not result:
+            return "UNKNOWN", 0.0, None, "NO_PLATE_BOX", None
+
+        raw_registration = str(
+            result.get("registration") or result.get("text") or ""
+        ).strip().upper()
         registration = re.sub(r"[^A-Z0-9]", "", raw_registration)
         ocr_confidence = float(result.get("ocr_confidence") or 0.0)
         bbox = result.get("bbox")
         status = str(result.get("status") or "OCR_FAILED").upper()
+        detector_confidence = float(result.get("confidence") or 0.0)
+
+        logger.info(
+            "[ANPR] tracker_id=%s detector_confidence=%.2f%% "
+            "ocr_confidence=%.2f%% raw=%r status=%s bbox=%s source=%s",
+            tracker_id, detector_confidence, ocr_confidence,
+            raw_registration, status, bbox,
+            result.get("plate_box_source", "dedicated_plate_model"),
+        )
 
         letters = sum(ch.isalpha() for ch in registration)
         digits = sum(ch.isdigit() for ch in registration)
         valid_candidate = (
-            5 <= len(registration) <= 10
-            and letters >= 2
-            and digits >= 2
+            4 <= len(registration) <= 10
+            and letters >= 1
+            and digits >= 1
             and registration not in {"OCRNOTREADABLE", "UNKNOWN"}
         )
+        # Save the localized colour crop even when OCR is uncertain. This
+        # gives the operator a close-up review image instead of losing a
+        # useful plate candidate merely because recognition did not pass.
+        plate_crop = result.get("plate_crop")
+        snippet_url = None
+        if isinstance(plate_crop, np.ndarray) and plate_crop.size:
+            PLATE_DIR.mkdir(parents=True, exist_ok=True)
+            safe_track = re.sub(r"[^A-Za-z0-9_-]", "_", str(tracker_id or "untracked"))
+            filename = f"plate_{safe_track}_{uuid.uuid4().hex[:12]}.jpg"
+            destination = PLATE_DIR / filename
+            if cv2.imwrite(
+                str(destination), plate_crop,
+                [cv2.IMWRITE_JPEG_QUALITY, 96],
+            ):
+                snippet_url = f"/uploads/plates/{filename}"
+                logger.info(
+                    "[ANPR] saved plate snippet tracker_id=%s url=%s",
+                    tracker_id, snippet_url,
+                )
+            else:
+                logger.error("[ANPR] failed to write plate snippet: %s", destination)
 
-        # Keep uncertain text out of the database as a confirmed plate, but log
-        # the detector/OCR outcome so a failed read can be diagnosed.
         if not valid_candidate or status != "READ" or ocr_confidence < 20.0:
             logger.info(
-                "[ANPR] plate not confirmed: raw=%r confidence=%.2f status=%s bbox=%s",
-                raw_registration, ocr_confidence, status, bbox,
+                "[ANPR] plate not confirmed tracker_id=%s raw=%r "
+                "confidence=%.2f status=%s snippet=%s",
+                tracker_id, raw_registration, ocr_confidence, status, snippet_url,
             )
-            return "UNKNOWN", ocr_confidence, bbox, (
-                "NO_PLATE_BOX" if status == "NO_PLATE_BOX" else "NEEDS_REVIEW"
+            return (
+                "UNKNOWN", ocr_confidence, bbox,
+                "NO_PLATE_BOX" if status == "NO_PLATE_BOX" else "NEEDS_REVIEW",
+                snippet_url,
             )
 
         logger.info(
-            "[ANPR] plate read: %s confidence=%.2f bbox=%s",
-            registration, ocr_confidence, bbox,
+            "[ANPR] accepted tracker_id=%s registration=%s confidence=%.2f",
+            tracker_id, registration, ocr_confidence,
         )
-        return registration, ocr_confidence, bbox, "READ"
+        return registration, ocr_confidence, bbox, "READ", snippet_url
 
     except Exception:
-        logger.exception("Number plate OCR failed")
-        return "UNKNOWN", 0.0, None, "OCR_EXCEPTION"
+        logger.exception("[ANPR] Number plate OCR failed tracker_id=%s", tracker_id)
+        return "UNKNOWN", 0.0, None, "OCR_EXCEPTION", None
 
 
 def _iou(a, b):
@@ -214,89 +657,231 @@ def _iou(a, b):
     return overlap / max(1, area_a + area_b - overlap)
 
 
+def _canonical_vehicle_name(raw_name):
+    """Normalize model labels while retaining the model's own class mapping."""
+    name = re.sub(r"[\s_-]+", " ", str(raw_name or "").strip().lower())
+    aliases = {
+        "motorbike": "motorcycle",
+        "motor cycle": "motorcycle",
+        "pickup truck": "pickup",
+        "pick up": "pickup",
+        "delivery van": "van",
+        "mini bus": "minibus",
+        "minibus": "minibus",
+    }
+    return aliases.get(name, name)
+
+
 def _collect_candidates(results, frame_w, frame_h):
+    """Extract vehicle boxes robustly from YOLO results and log rejected labels."""
     candidates = []
-
-    for result in results:
-        if result.boxes is None:
+    raw_seen = []
+    for result in results or []:
+        boxes = getattr(result, "boxes", None)
+        if boxes is None:
             continue
-
-        for box in result.boxes:
-            class_id = int(box.cls[0].item())
-            vehicle_type = str(model.names[class_id]).lower()
-
-            if vehicle_type not in VEHICLE_CLASSES:
+        for box in boxes:
+            try:
+                class_id = int(box.cls[0].item())
+                raw_name = VEHICLE_NAMES.get(class_id, str(class_id))
+                vehicle_type = _canonical_vehicle_name(raw_name)
+                confidence = float(box.conf[0].item())
+                coords = box.xyxy[0].tolist()
+                x1, y1, x2, y2 = [int(round(float(v))) for v in coords]
+            except (AttributeError, IndexError, TypeError, ValueError, RuntimeError):
+                logger.debug("Skipping malformed YOLO detection box", exc_info=True)
                 continue
 
-            confidence = float(box.conf[0].item())
-            x1, y1, x2, y2 = [
-                int(value) for value in box.xyxy[0].tolist()
-            ]
+            raw_seen.append((str(raw_name), round(confidence, 3)))
+            if vehicle_type not in VEHICLE_CLASSES:
+                continue
 
             x1 = max(0, min(x1, frame_w - 1))
             y1 = max(0, min(y1, frame_h - 1))
             x2 = max(0, min(x2, frame_w))
             y2 = max(0, min(y2, frame_h))
-
-            if x2 - x1 < 35 or y2 - y1 < 35:
+            if x2 - x1 < 8 or y2 - y1 < 8:
                 continue
 
-            track_id = (
-                int(box.id.item())
-                if box.id is not None
-                else None
-            )
+            track_id = None
+            try:
+                if box.id is not None:
+                    track_id = int(box.id.item())
+            except (AttributeError, TypeError, ValueError, RuntimeError):
+                track_id = None
+            candidates.append((confidence, vehicle_type, (x1, y1, x2, y2), track_id))
 
-            candidates.append(
-                (confidence, vehicle_type, (x1, y1, x2, y2), track_id)
-            )
+    if raw_seen and not candidates:
+        logger.warning(
+            "[YOLO11] Raw detections were produced but none matched vehicle classes. "
+            "Configured names=%s raw=%s",
+            VEHICLE_NAMES, raw_seen[:30],
+        )
+    elif candidates:
+        logger.debug("[YOLO11] Accepted vehicle candidates=%d raw=%s", len(candidates), raw_seen[:20])
 
     candidates.sort(key=lambda item: item[0], reverse=True)
     accepted = []
-
     for candidate in candidates:
-        confidence, vehicle_type, box, track_id = candidate
-        x1, y1, x2, y2 = box
-        area = max(1, (x2 - x1) * (y2 - y1))
-
-        duplicate = False
-
-        for previous in accepted:
-            _, previous_type, previous_box, _ = previous
-
-            if vehicle_type != previous_type:
-                continue
-
-            px1, py1, px2, py2 = previous_box
-
-            ix1 = max(x1, px1)
-            iy1 = max(y1, py1)
-            ix2 = min(x2, px2)
-            iy2 = min(y2, py2)
-
-            intersection = (
-                max(0, ix2 - ix1) * max(0, iy2 - iy1)
-            )
-
-            previous_area = max(
-                1, (px2 - px1) * (py2 - py1)
-            )
-
-            union = area + previous_area - intersection
-            iou = intersection / max(1, union)
-
-            # Detect a small box largely contained within a
-            # larger box of the same class.
-            containment = intersection / min(area, previous_area)
-
-            if iou > 0.60 or containment > 0.90:
-                duplicate = True
-                break
-
-        if not duplicate:
-            accepted.append(candidate)
-
+        _, vehicle_type, box, _ = candidate
+        if any(
+            vehicle_type == prev[1] and _iou(box, prev[2]) > 0.60
+            for prev in accepted
+        ):
+            continue
+        accepted.append(candidate)
     return accepted
+
+
+def _detect_specialised_regions_for_vehicles(frame, candidates, plate_cache=None, frame_index=0):
+    """Run YOLO26n on vehicle crops periodically and reuse per-track results.
+
+    Cached boxes are stored relative to each vehicle box, then remapped to the
+    current vehicle position. This keeps annotations aligned while a vehicle
+    moves between specialised-model inference frames.
+    """
+    if not candidates:
+        return []
+
+    if plate_cache is None:
+        plate_cache = {}
+
+    pending_crops = []
+    pending_meta = []
+    regions_by_record = {}
+
+    for confidence, vehicle_type, vehicle_box, track_id in candidates:
+        x1, y1, x2, y2 = vehicle_box
+        record_id = int(track_id) if track_id is not None else int(
+            (x1 * 73856093 + y1 * 19349663 + x2 * 83492791 + y2 * 2654435761)
+            % 1_000_000_000
+        )
+        entry = plate_cache.setdefault(record_id, {})
+        entry.setdefault("registration", "UNKNOWN")
+        entry.setdefault("ocr_confidence", 0.0)
+        entry.setdefault("attempts", 0)
+        entry.setdefault("last_attempt", -10_000)
+        entry.setdefault("bbox", None)
+        entry.setdefault("stable", 0)
+        entry.setdefault("last_seen", -10_000)
+        entry.setdefault("ocr_status", "NOT_ATTEMPTED")
+        entry.setdefault("plate_snippet", None)
+        cached = entry.get("specialised_cache")
+        last_frame = int(entry.get("specialised_last_frame", -10_000))
+        needs_refresh = (
+            cached is None
+            or frame_index - last_frame >= SPECIAL_INFERENCE_INTERVAL
+            or frame_index - last_frame > SPECIAL_CACHE_MAX_AGE
+        )
+
+        if needs_refresh:
+            # Include substantial context above and beside the vehicle so
+            # an oversized load is not clipped before YOLO26 sees it.
+            crop, offset_x, offset_y = _padded_vehicle_crop(
+                frame, vehicle_box, horizontal=0.22, vertical=0.48
+            )
+            if crop is not None and crop.size:
+                pending_crops.append(crop)
+                pending_meta.append((record_id, vehicle_box, x1 - offset_x, y1 - offset_y))
+        else:
+            regions_by_record[record_id] = _remap_cached_regions(cached, vehicle_box)
+
+    if pending_crops:
+        try:
+            kwargs = {
+                "source": pending_crops,
+                "imgsz": SPECIAL_IMAGE_SIZE,
+                "conf": SPECIAL_CONFIDENCE,
+                "iou": YOLO_IOU,
+                "max_det": SPECIAL_MAX_DETECTIONS,
+                "verbose": False,
+            }
+            if not SPECIAL_IS_NCNN:
+                kwargs["device"] = DEVICE
+            results = cargo_plate_model.predict(**kwargs)
+        except Exception:
+            logger.exception("[YOLO26] Batched vehicle-crop inference failed")
+            results = []
+
+        frame_h, frame_w = frame.shape[:2]
+        for result, (record_id, vehicle_box, crop_left, crop_top) in zip(results or [], pending_meta):
+            x1, y1, x2, y2 = vehicle_box
+            vehicle_w, vehicle_h = max(1, x2 - x1), max(1, y2 - y1)
+            absolute_regions = []
+            if result.boxes is not None:
+                for box in result.boxes:
+                    class_id = int(box.cls[0].item())
+                    cx1, cy1, cx2, cy2 = [int(v) for v in box.xyxy[0].tolist()]
+                    ax1 = max(0, min(frame_w, cx1 + crop_left))
+                    ay1 = max(0, min(frame_h, cy1 + crop_top))
+                    ax2 = max(0, min(frame_w, cx2 + crop_left))
+                    ay2 = max(0, min(frame_h, cy2 + crop_top))
+                    if ax2 <= ax1 or ay2 <= ay1:
+                        continue
+                    absolute_regions.append({
+                        "class_id": class_id,
+                        "class_name": SPECIAL_NAMES.get(class_id, f"class_{class_id}"),
+                        "confidence": float(box.conf[0].item()),
+                        "box": (ax1, ay1, ax2, ay2),
+                    })
+
+            # Cache normalized coordinates relative to the vehicle, not the frame.
+            normalized = []
+            for region in absolute_regions:
+                rx1, ry1, rx2, ry2 = region["box"]
+                normalized.append({
+                    "class_id": region["class_id"],
+                    "class_name": region["class_name"],
+                    "confidence": region["confidence"],
+                    "relative_box": (
+                        (rx1 - x1) / vehicle_w,
+                        (ry1 - y1) / vehicle_h,
+                        (rx2 - x1) / vehicle_w,
+                        (ry2 - y1) / vehicle_h,
+                    ),
+                })
+            entry = plate_cache.setdefault(record_id, {})
+            entry["specialised_cache"] = normalized
+            entry["specialised_last_frame"] = frame_index
+            regions_by_record[record_id] = absolute_regions
+
+    # Return a flat list, preserving the existing _regions_for_vehicle interface.
+    return [region for group in regions_by_record.values() for region in group]
+
+
+def _remap_cached_regions(cached_regions, vehicle_box):
+    x1, y1, x2, y2 = vehicle_box
+    width, height = max(1, x2 - x1), max(1, y2 - y1)
+    remapped = []
+    for item in cached_regions or []:
+        rx1, ry1, rx2, ry2 = item["relative_box"]
+        box = (
+            int(x1 + rx1 * width), int(y1 + ry1 * height),
+            int(x1 + rx2 * width), int(y1 + ry2 * height),
+        )
+        remapped.append({
+            "class_id": item["class_id"],
+            "class_name": item["class_name"],
+            "confidence": item["confidence"],
+            "box": box,
+        })
+    return remapped
+
+
+def _regions_for_vehicle(regions, vehicle_box):
+    x1, y1, x2, y2 = vehicle_box
+    pad_x = max(5, int((x2 - x1) * 0.15))
+    pad_y = max(5, int((y2 - y1) * 0.15))
+    left, top = x1 - pad_x, y1 - pad_y
+    right, bottom = x2 + pad_x, y2 + pad_y
+    matched = []
+    for region in regions:
+        rx1, ry1, rx2, ry2 = region["box"]
+        ix1, iy1 = max(left, rx1), max(top, ry1)
+        ix2, iy2 = min(right, rx2), min(bottom, ry2)
+        if ix2 > ix1 and iy2 > iy1:
+            matched.append(region)
+    return matched
 
 
 def _label(frame, line, x, y, color, scale=0.48):
@@ -339,70 +924,239 @@ def _analyse_frame(
     polygon = _polygon_for_frame(width, height)
     cv2.polylines(annotated, [polygon], True, (0, 255, 180), 2)
 
-    # Do not pass the deprecated Ultralytics `half` argument. Ultralytics
-    # chooses a supported inference precision automatically for this install.
+    frame_started = time.perf_counter()
+
+    # Stage 1: YOLO11n detects/tracks vehicles on every analysed frame.
+    # Keeping this stage per-frame is important for ByteTrack continuity.
+    vehicle_started = time.perf_counter()
+    vehicle_kwargs = {
+        "imgsz": YOLO_IMAGE_SIZE,
+        "conf": YOLO_CONFIDENCE,
+        "iou": YOLO_IOU,
+        "max_det": MAX_DETECTIONS,
+        "classes": VEHICLE_CLASS_IDS,
+        "verbose": False,
+    }
+    if not VEHICLE_IS_NCNN:
+        vehicle_kwargs["device"] = DEVICE
+
     with torch.inference_mode():
         if video:
-            results = model.track(
-                frame, persist=True, tracker="bytetrack.yaml",
-                imgsz=YOLO_IMAGE_SIZE, conf=YOLO_CONFIDENCE, iou=YOLO_IOU,
-                classes=VEHICLE_CLASS_IDS, max_det=MAX_DETECTIONS,
-                device=DEVICE, verbose=False,
+            vehicle_results = vehicle_model.track(
+                frame, persist=True, tracker="bytetrack.yaml", **vehicle_kwargs
             )
+            # Do not fall back to predict() here. A second inference would
+            # bypass ByteTrack and produce detections without persistent IDs.
+            if not any(
+                getattr(result, "boxes", None) is not None
+                and len(result.boxes) > 0
+                for result in (vehicle_results or [])
+            ):
+                logger.debug(
+                    "[YOLO11] No tracked vehicle boxes on frame=%s; "
+                    "continuing with the tracker state intact.",
+                    frame_index,
+                )
         else:
-            results = model.predict(
-                frame, imgsz=YOLO_IMAGE_SIZE, conf=YOLO_CONFIDENCE, iou=YOLO_IOU,
-                classes=VEHICLE_CLASS_IDS, max_det=MAX_DETECTIONS,
-                device=DEVICE, verbose=False,
-            )
+            vehicle_results = vehicle_model.predict(frame, **vehicle_kwargs)
 
+    vehicle_ms = (time.perf_counter() - vehicle_started) * 1000.0
     detections = []
     stats = {"vehicles": 0, "warnings": 0, "overloaded": 0}
-    candidates = _collect_candidates(results, width, height)
+    candidates = _collect_candidates(vehicle_results, width, height)
+    if not candidates:
+        raw_summary = []
+        for result in vehicle_results or []:
+            if result.boxes is None:
+                continue
+            for box in result.boxes:
+                class_id = int(box.cls[0].item())
+                raw_summary.append({
+                    "class": VEHICLE_NAMES.get(class_id, str(class_id)),
+                    "confidence": round(float(box.conf[0].item()), 3),
+                })
+        logger.warning(
+            "[YOLO11] No accepted vehicles: backend=%s conf=%.2f imgsz=%s "
+            "frame=%sx%s raw_detections=%s",
+            "NCNN" if VEHICLE_IS_NCNN else "PyTorch",
+            YOLO_CONFIDENCE, YOLO_IMAGE_SIZE, width, height, raw_summary[:30],
+        )
+
+    # Stage 2: specialised inference is throttled per track and cached between
+    # runs. This is the main CPU-saving step for continuous camera/video input.
+    special_started = time.perf_counter()
+    with torch.inference_mode():
+        specialised_regions = _detect_specialised_regions_for_vehicles(
+            frame, candidates, plate_cache=plate_cache, frame_index=frame_index
+        )
+    special_ms = (time.perf_counter() - special_started) * 1000.0
 
     for confidence, vehicle_type, (x1, y1, x2, y2), track_id in candidates:
         record_id = int(track_id) if track_id is not None else int((x1 * 73856093 + y1 * 19349663 + x2 * 83492791 + y2 * 2654435761) % 1_000_000_000)
-        entry = plate_cache.setdefault(
-            record_id,
-            {
-                "registration": "UNKNOWN",
-                "ocr_confidence": 0.0,
-                "attempts": 0,
-                "last_attempt": -10_000,
-                "bbox": None,
-                "stable": 0,
-                "last_seen": -10_000,
-                "ocr_status": "NOT_ATTEMPTED",
-            },
-        )
+        # Specialised inference may have created this entry first.
+        # setdefault does not populate missing keys in an existing dict.
+        entry = plate_cache.setdefault(record_id, {})
+        entry.setdefault("registration", "UNKNOWN")
+        entry.setdefault("ocr_confidence", 0.0)
+        entry.setdefault("attempts", 0)
+        entry.setdefault("last_attempt", -10_000)
+        entry.setdefault("bbox", None)
+        entry.setdefault("stable", 0)
+        entry.setdefault("last_seen", -10_000)
+        entry.setdefault("ocr_status", "NOT_ATTEMPTED")
+        entry.setdefault("plate_snippet", None)
 
         vehicle_box = (x1, y1, x2, y2)
         vehicle_crop = frame[y1:y2, x1:x2]
         # Separate visual cargo screening; vehicle YOLO and ByteTrack are unchanged.
-        cargo_assessment = assess_cargo_risk(vehicle_crop, vehicle_type)
+        # Keep plate detections strictly inside the vehicle, but allow cargo
+        # boxes immediately above/alongside the body so protruding loads are
+        # not discarded before the geometry check.
+        vehicle_special_regions = _regions_for_vehicle(
+            specialised_regions, vehicle_box
+        )
+        cargo_regions = []
+        for region in specialised_regions or []:
+            name = str(region.get("class_name", "")).strip().lower()
+            cargo_class = (
+                name in {"cargo", "load", "luggage", "roof_load", "roof cargo"}
+                or any(token in name for token in (
+                    "cargo_load", "loaded_goods", "stacked_load",
+                    "tyre_load", "tire_load", "roof_load",
+                ))
+            )
+            if not cargo_class:
+                continue
+            rx1, ry1, rx2, ry2 = region.get("box", (0, 0, 0, 0))
+            if float(region.get("confidence", 0.0)) < 0.35:
+                continue
+
+            pad_x = int((x2 - x1) * 0.25)
+            pad_y = int((y2 - y1) * 0.50)
+            # Cargo can extend above the roof or beyond the sides. Associate
+            # it with this vehicle only when it is horizontally near the body
+            # and not separated from it by a large vertical gap.
+            horizontal_overlap = max(
+                0, min(x2, rx2) - max(x1, rx1)
+            )
+            horizontal_near = (
+                rx2 >= x1 - pad_x and rx1 <= x2 + pad_x
+            )
+            vertical_near = (
+                ry2 >= y1 - pad_y and ry1 <= y2 + int((y2 - y1) * 0.20)
+            )
+            if horizontal_near and vertical_near and (
+                horizontal_overlap > 0 or rx1 < x1 or rx2 > x2
+            ):
+                cargo_regions.append(region)
+
+        cargo_assessment = assess_cargo_risk(
+            vehicle_crop, vehicle_type, cargo_regions, vehicle_box=vehicle_box
+        )
+        if cargo_regions:
+            logger.info(
+                "[CARGO] tracker_id=%s candidates=%s vehicle_box=%s cargo_boxes=%s",
+                record_id,
+                len(cargo_regions),
+                vehicle_box,
+                [region.get("box") for region in cargo_regions],
+            )
+        # Confirm cargo protrusion against the vehicle detector's box.
+        # A cargo box merely located on/inside a car is not overload evidence.
+        protrusion = []
+        for region in cargo_regions:
+            rx1, ry1, rx2, ry2 = region["box"]
+            protrudes_top = ry1 < y1 - max(4, int((y2 - y1) * 0.03))
+            protrudes_left = rx1 < x1 - max(4, int((x2 - x1) * 0.03))
+            protrudes_right = rx2 > x2 + max(4, int((x2 - x1) * 0.03))
+            if protrudes_top or protrudes_left or protrudes_right:
+                protrusion.append(region)
+        if protrusion:
+            cargo_assessment.update(
+                cargo_risk_score=70,
+                cargo_risk_level="WARNING",
+                cargo_model_status="CONFIRMED_CARGO_PROTRUSION",
+                cargo_indicators=["CARGO_EXTENDS_BEYOND_VEHICLE_BOUNDARY"],
+            )
+        else:
+            cargo_assessment.update(
+                cargo_risk_score=0,
+                cargo_risk_level="NO_VISUAL_INDICATOR",
+                cargo_model_status=(
+                    "CARGO_DETECTED_WITHIN_VEHICLE_BOUNDARY"
+                    if cargo_regions else "NO_CARGO_DETECTED"
+                ),
+                cargo_indicators=[],
+            )
 
         should_attempt_ocr = (
-            entry["registration"] in {"UNKNOWN", ""}
+            entry.get("registration", "UNKNOWN") in {"UNKNOWN", ""}
             and entry["attempts"] < MAX_OCR_ATTEMPTS
             and frame_index - entry["last_attempt"] >= OCR_RETRY_INTERVAL
         )
         if should_attempt_ocr:
             padded_crop, offset_x, offset_y = _padded_vehicle_crop(frame, vehicle_box)
-            registration, ocr_conf, plate_bbox, ocr_status = _read_plate(padded_crop)
+
+            # YOLO26 specialised plate detections are in full-frame coordinates.
+            # Convert the best plate box into padded-crop coordinates for OCR.
+            plate_regions = [
+                region for region in vehicle_special_regions
+                if any(
+                    token in str(region.get("class_name", "")).lower()
+                    for token in ("plate", "licence", "license")
+                )
+            ]
+            supplied_plate_bbox = None
+            supplied_plate_confidence = 0.0
+            if plate_regions:
+                best_plate_region = max(
+                    plate_regions, key=lambda item: item["confidence"]
+                )
+                rx1, ry1, rx2, ry2 = best_plate_region["box"]
+                crop_left = x1 - offset_x
+                crop_top = y1 - offset_y
+                supplied_plate_bbox = (
+                    rx1 - crop_left, ry1 - crop_top,
+                    rx2 - crop_left, ry2 - crop_top,
+                )
+                supplied_plate_confidence = float(
+                    best_plate_region.get("confidence", 0.0)
+                )
+                logger.info(
+                    "[ANPR] YOLO26 plate candidate box=%s detector_confidence=%.3f",
+                    supplied_plate_bbox,
+                    supplied_plate_confidence,
+                )
+
+            registration, ocr_conf, plate_bbox, ocr_status, plate_snippet = _read_plate(
+                padded_crop,
+                plate_bbox=supplied_plate_bbox,
+                plate_detection_confidence=supplied_plate_confidence,
+                tracker_id=record_id,
+            )
+            logger.info(
+                "[ANPR] primary OCR outcome registration=%s ocr_confidence=%.2f status=%s",
+                registration, ocr_conf, ocr_status,
+            )
             bbox_offset_x, bbox_offset_y = offset_x, offset_y
 
             # The padded crop gives the plate detector context around the car.
             # If it fails, retry on the tighter vehicle crop; the bbox returned
             # by this second call is already relative to vehicle_crop.
             if registration == "UNKNOWN" and vehicle_crop.size:
-                retry_registration, retry_conf, retry_bbox, retry_status = _read_plate(vehicle_crop)
+                retry_registration, retry_conf, retry_bbox, retry_status, retry_snippet = _read_plate(
+                    vehicle_crop, tracker_id=record_id
+                )
                 if retry_registration != "UNKNOWN":
                     registration, ocr_conf, plate_bbox, ocr_status = (
                         retry_registration, retry_conf, retry_bbox, retry_status
                     )
+                    plate_snippet = retry_snippet
                     bbox_offset_x, bbox_offset_y = 0, 0
                 elif retry_conf > ocr_conf:
                     ocr_conf, plate_bbox, ocr_status = retry_conf, retry_bbox, retry_status
+                    if retry_snippet:
+                        plate_snippet = retry_snippet
                     # If the best diagnostic bbox came from the tight crop,
                     # it must not be translated by the padded-crop offset.
                     bbox_offset_x, bbox_offset_y = 0, 0
@@ -425,6 +1179,12 @@ def _analyse_frame(
                     registration=registration,
                     ocr_confidence=ocr_conf,
                     bbox=plate_bbox,
+                    plate_snippet=plate_snippet or entry.get("plate_snippet"),
+                )
+                logger.info(
+                    "[ANPR] ACCEPTED tracker_id=%s registration=%s "
+                    "ocr_confidence=%.2f%%",
+                    record_id, registration, ocr_conf,
                 )
 
         problem = _visibility_reason(vehicle_box, polygon, width, height)
@@ -436,19 +1196,78 @@ def _analyse_frame(
         else:
             if entry["last_seen"] != frame_index - 1:
                 entry["stable"] = 0
+                entry["warning_stable"] = 0
+
             entry["last_seen"] = frame_index
             entry["stable"] = entry["stable"] + 1 if problem is None else 0
             eligible = problem is None and entry["stable"] >= STABLE_FRAMES
-            if problem is None and not eligible:
-                problem = "WAITING FOR COMPLETE VEHICLE"
 
-        if eligible and record_id not in saved_tracks:
+        # Confirmed unsafe cargo must not be discarded just because the
+        # vehicle touches the frame edge or crosses the normal capture zone.
+        # Keep a short stability requirement for live/video to avoid saving
+        # one-frame false positives.
+        current_classification = classify_overload(
+            vehicle_type, x2 - x1, y2 - y1, cargo_assessment
+        )
+        if current_classification == "WARNING" and confidence >= MIN_CONFIDENCE:
+            entry["warning_stable"] = entry.get("warning_stable", 0) + 1
+        else:
+            entry["warning_stable"] = 0
+
+        warning_save_eligible = (
+            current_classification == "WARNING"
+            and confidence >= MIN_CONFIDENCE
+            and (
+                not video
+                or entry.get("warning_stable", 0) >= STABLE_FRAMES
+            )
+        )
+        save_eligible = eligible or warning_save_eligible
+
+        if (
+            problem is not None
+            and warning_save_eligible
+            and not eligible
+        ):
+            logger.warning(
+                "[SAVE] Saving confirmed overload despite visibility gate: "
+                "tracker_id=%s reason=%s",
+                record_id, problem,
+            )
+
+        if save_eligible and record_id not in saved_tracks:
             snapshot_name = f"{uuid.uuid4().hex}.jpg"
-            snapshot = vehicle_crop.copy()
+
+            # One saved object = the vehicle together with its associated
+            # detected cargo. The crop is the union of the vehicle box and
+            # cargo boxes; plates and cargo are not saved as separate records.
+            combined_x1, combined_y1 = x1, y1
+            combined_x2, combined_y2 = x2, y2
+            for cargo_region in cargo_regions:
+                cx1, cy1, cx2, cy2 = map(int, cargo_region["box"])
+                combined_x1 = min(combined_x1, cx1)
+                combined_y1 = min(combined_y1, cy1)
+                combined_x2 = max(combined_x2, cx2)
+                combined_y2 = max(combined_y2, cy2)
+
+            combined_x1 = max(0, min(combined_x1, width - 1))
+            combined_y1 = max(0, min(combined_y1, height - 1))
+            combined_x2 = max(combined_x1 + 1, min(combined_x2, width))
+            combined_y2 = max(combined_y1 + 1, min(combined_y2, height))
+            snapshot = frame[
+                combined_y1:combined_y2, combined_x1:combined_x2
+            ].copy()
+
+            # Plate coordinates are stored relative to the original vehicle
+            # crop. Translate them into the combined snapshot coordinate space.
             plate_bbox = entry.get("bbox")
             if plate_bbox is not None:
                 try:
                     px1, py1, px2, py2 = [int(value) for value in plate_bbox]
+                    px1 += x1 - combined_x1
+                    px2 += x1 - combined_x1
+                    py1 += y1 - combined_y1
+                    py2 += y1 - combined_y1
                     if (
                         0 <= px1 < px2 <= snapshot.shape[1]
                         and 0 <= py1 < py2 <= snapshot.shape[0]
@@ -481,10 +1300,21 @@ def _analyse_frame(
                 "cargo_risk_level": cargo_assessment["cargo_risk_level"],
                 "cargo_indicators": cargo_assessment["cargo_indicators"],
                 "cargo_assessment_method": cargo_assessment["cargo_assessment_method"],
+                "specialised_detections": [
+                    {
+                        "class_name": region["class_name"],
+                        "confidence": round(region["confidence"] * 100, 2),
+                        "bbox": list(region["box"]),
+                    }
+                    for region in vehicle_special_regions
+                ],
                 "snapshot": snapshot_url,
+                "plate_snippet": entry.get("plate_snippet"),
                 "location": location,
             }
             detections.append(record)
+            entry["saved_record"] = record
+            entry["saved_snapshot"] = snapshot_url
             if records_by_id is not None:
                 records_by_id[record_id] = record
 
@@ -501,6 +1331,17 @@ def _analyse_frame(
                     location=location,
                     snapshot=snapshot_url,
                 )
+                _csv_upsert_vehicle(
+                    tracker_id=int(record_id),
+                    vehicle_type=vehicle_type.title(),
+                    registration_number=entry["registration"],
+                    confidence=round(confidence * 100, 2),
+                    overload_status=record["overload_status"],
+                    severity_score=int(record["severity_score"]),
+                    location=location,
+                    snapshot=snapshot_url,
+                    plate_snippet=entry.get("plate_snippet"),
+                )
             except Exception:
                 logger.exception(
                     "[DATABASE] Could not save vehicle tracker_id=%s",
@@ -511,11 +1352,118 @@ def _analyse_frame(
             if record["overload_status"] == "WARNING":
                 stats["warnings"] += 1
 
+        # A track may have been saved before the specialised model recognised
+        # its cargo. Never leave that first NORMAL row unchanged: promote it
+        # as soon as a later frame confirms visible cargo protrusion.
+        existing_record = entry.get("saved_record")
+        current_status = classify_overload(
+            vehicle_type, x2 - x1, y2 - y1, cargo_assessment
+        )
+        if (
+            record_id in saved_tracks
+            and existing_record is not None
+            and current_status == "WARNING"
+            and existing_record.get("overload_status") != "WARNING"
+        ):
+            # Rebuild the snapshot from the union of vehicle and cargo boxes.
+            snap_x1, snap_y1, snap_x2, snap_y2 = x1, y1, x2, y2
+            for cargo_region in cargo_regions:
+                cx1, cy1, cx2, cy2 = map(int, cargo_region["box"])
+                snap_x1 = min(snap_x1, cx1)
+                snap_y1 = min(snap_y1, cy1)
+                snap_x2 = max(snap_x2, cx2)
+                snap_y2 = max(snap_y2, cy2)
+
+            snap_x1 = max(0, min(snap_x1, width - 1))
+            snap_y1 = max(0, min(snap_y1, height - 1))
+            snap_x2 = max(snap_x1 + 1, min(snap_x2, width))
+            snap_y2 = max(snap_y1 + 1, min(snap_y2, height))
+            combined_snapshot = frame[snap_y1:snap_y2, snap_x1:snap_x2].copy()
+
+            new_snapshot_url = existing_record.get("snapshot")
+            promoted_snapshot_name = f"{uuid.uuid4().hex}.jpg"
+            if combined_snapshot.size and cv2.imwrite(
+                str(SNAPSHOT_DIR / promoted_snapshot_name),
+                combined_snapshot,
+                [cv2.IMWRITE_JPEG_QUALITY, 88],
+            ):
+                new_snapshot_url = f"/uploads/snapshots/{promoted_snapshot_name}"
+
+            existing_record.update({
+                "overload_status": "WARNING",
+                "severity_score": max(
+                    float(existing_record.get("severity_score") or 0),
+                    float(cargo_assessment.get("cargo_risk_score") or 70),
+                    70.0,
+                ),
+                "cargo_risk_score": max(
+                    int(existing_record.get("cargo_risk_score") or 0),
+                    int(cargo_assessment.get("cargo_risk_score") or 70),
+                    70,
+                ),
+                "cargo_risk_level": "WARNING",
+                "cargo_indicators": cargo_assessment.get(
+                    "cargo_indicators",
+                    ["CARGO_EXTENDS_BEYOND_VEHICLE_BOUNDARY"],
+                ),
+                "snapshot": new_snapshot_url,
+            })
+            entry["saved_snapshot"] = new_snapshot_url
+
+            try:
+                save_or_update_detection(
+                    tracker_id=int(record_id),
+                    vehicle_type=vehicle_type.title(),
+                    registration_number=entry.get("registration", "UNKNOWN"),
+                    confidence=round(confidence * 100, 2),
+                    overload_status="WARNING",
+                    severity_score=int(existing_record["severity_score"]),
+                    location=location,
+                    snapshot=new_snapshot_url,
+                )
+                _csv_upsert_vehicle(
+                    tracker_id=int(record_id),
+                    vehicle_type=vehicle_type.title(),
+                    registration_number=entry.get("registration", "UNKNOWN"),
+                    confidence=round(confidence * 100, 2),
+                    overload_status="WARNING",
+                    severity_score=int(existing_record["severity_score"]),
+                    location=location,
+                    snapshot=new_snapshot_url,
+                )
+                logger.warning(
+                    "[CARGO] PROMOTED tracker_id=%s to OVERLOAD; snapshot=%s",
+                    record_id, new_snapshot_url,
+                )
+            except Exception:
+                logger.exception(
+                    "[CARGO] Could not persist overload promotion for tracker_id=%s",
+                    record_id,
+                )
+
         if records_by_id is not None and record_id in records_by_id:
             old_record = records_by_id[record_id]
             if entry["registration"] != "UNKNOWN":
                 old_record["registration_number"] = entry["registration"]
                 old_record["plate_confidence"] = round(entry["ocr_confidence"], 2)
+                old_record["plate_snippet"] = entry.get("plate_snippet")
+
+        # Link a localized plate crop to the already-saved vehicle row even
+        # when OCR is not yet confident enough to confirm the registration.
+        if entry.get("plate_snippet") and record_id in saved_tracks:
+            try:
+                _csv_update_plate_snippet(
+                    tracker_id=int(record_id),
+                    plate_snippet=entry["plate_snippet"],
+                    location=location,
+                )
+                if records_by_id is not None and record_id in records_by_id:
+                    records_by_id[record_id]["plate_snippet"] = entry["plate_snippet"]
+            except Exception:
+                logger.exception(
+                    "[CSV] Could not link plate snippet for tracker_id=%s",
+                    record_id,
+                )
 
         # ANPR may succeed several frames after the vehicle was first saved.
         # Update the existing row for this tracker rather than inserting again.
@@ -525,6 +1473,12 @@ def _analyse_frame(
                     tracker_id=int(record_id),
                     registration_number=entry["registration"],
                     location=location,
+                )
+                _csv_update_registration(
+                    tracker_id=int(record_id),
+                    registration_number=entry["registration"],
+                    location=location,
+                    plate_snippet=entry.get("plate_snippet"),
                 )
                 if updated is None:
                     logger.warning(
@@ -537,42 +1491,45 @@ def _analyse_frame(
                     record_id,
                 )
 
-        color = (0, 200, 0) if eligible else (0, 165, 255)
-        cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 3)
-        _label(annotated, f"{vehicle_type.upper()} | ID:{record_id}", x1, y1 - 8, color)
-        cargo_label = (
-            f"CARGO REVIEW: {cargo_assessment['cargo_risk_score']}/100"
-            if cargo_assessment["cargo_risk_level"] == "REVIEW_REQUIRED"
-            else "NO CARGO INDICATOR"
+        saved_record = records_by_id.get(record_id, {}) if records_by_id is not None else {}
+        current_status = saved_record.get(
+            "overload_status",
+            classify_overload(vehicle_type, x2 - x1, y2 - y1, cargo_assessment),
         )
-        cargo_color = (
-            (0, 165, 255)
-            if cargo_assessment["cargo_risk_level"] == "REVIEW_REQUIRED"
-            else (180, 180, 180)
-        )
-        _label(annotated, cargo_label, x1, min(height - 44, y2 + 44), cargo_color, 0.42)
-        status_text = (
-            records_by_id[record_id].get("overload_status", "NORMAL")
-            if records_by_id is not None and record_id in records_by_id
-            else "NORMAL"
-        )
-        _label(
-            annotated,
-            status_text if eligible else (problem or "CHECKING"),
-            x1, min(height - 24, y2 + 20), color,
-        )
-        if entry["registration"] not in {"UNKNOWN", ""}:
-            _label(
-                annotated,
-                f"PLATE: {entry['registration']} ({entry['ocr_confidence']:.0f}%)",
-                x1, min(height - 4, y2 + 40), (255, 255, 255),
-            )
-        elif entry["ocr_status"] not in {"NOT_ATTEMPTED", "NO_PLATE_BOX"}:
-            _label(
-                annotated, f"PLATE: {entry['ocr_status']}",
-                x1, min(height - 4, y2 + 40), (255, 255, 255),
-            )
+        color = (0, 0, 255) if current_status == "WARNING" else ((0, 200, 0) if eligible else (0, 165, 255))
 
+        # Same union geometry as the saved snapshot: truck + associated load.
+        display_x1, display_y1 = x1, y1
+        display_x2, display_y2 = x2, y2
+        for cargo_region in cargo_regions:
+            cx1, cy1, cx2, cy2 = map(int, cargo_region["box"])
+            display_x1 = min(display_x1, cx1)
+            display_y1 = min(display_y1, cy1)
+            display_x2 = max(display_x2, cx2)
+            display_y2 = max(display_y2, cy2)
+        display_x1 = max(0, min(display_x1, width - 1))
+        display_y1 = max(0, min(display_y1, height - 1))
+        display_x2 = max(display_x1 + 1, min(display_x2, width))
+        display_y2 = max(display_y1 + 1, min(display_y2, height))
+
+        cv2.rectangle(
+            annotated, (display_x1, display_y1),
+            (display_x2, display_y2), color, 3
+        )
+
+
+    total_ms = (time.perf_counter() - frame_started) * 1000.0
+    if video and frame_index > 0 and frame_index % PERFORMANCE_LOG_INTERVAL == 0:
+        logger.info(
+            "[PERFORMANCE] frame=%s vehicles=%s vehicle_model=%.1fms specialised=%.1fms total=%.1fms effective_fps=%.2f",
+            frame_index, len(candidates), vehicle_ms, special_ms, total_ms,
+            1000.0 / max(total_ms, 1.0),
+        )
+
+    stats["processing_ms"] = round(total_ms, 1)
+    stats["processing_fps"] = round(1000.0 / max(total_ms, 1.0), 2)
+    stats["vehicle_inference_ms"] = round(vehicle_ms, 1)
+    stats["specialised_inference_ms"] = round(special_ms, 1)
     return annotated, detections, stats
 
 
@@ -669,24 +1626,28 @@ def process_video(
     video_path,
     processed_video,
     location="Polokwane Weighbridge",
+    progress_callback=None,
 ):
-    """Process a video, run vehicle/plate detection, and save the output."""
-    capture = cv2.VideoCapture(str(video_path))
+    """Process an uploaded video with OpenCV only (no HLS or FFmpeg CLI).
 
+    Frames are read with VideoCapture, analysed by the existing YOLO pipeline,
+    and written directly to one annotated MP4 with VideoWriter.
+    """
+    capture = cv2.VideoCapture(str(video_path))
     if not capture.isOpened():
         capture.release()
-        raise ValueError(f"Could not open video: {video_path}")
+        raise ValueError(f"Could not open uploaded video: {video_path}")
 
     width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps = float(capture.get(cv2.CAP_PROP_FPS))
+    total_frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
 
     if not np.isfinite(fps) or fps <= 0:
         fps = 25.0
-
     if width <= 0 or height <= 0:
         capture.release()
-        raise ValueError("Video has invalid dimensions")
+        raise ValueError("Uploaded video has invalid dimensions")
 
     processed_video = Path(processed_video)
     processed_video.parent.mkdir(parents=True, exist_ok=True)
@@ -697,39 +1658,35 @@ def process_video(
         fps,
         (width, height),
     )
-
     if not writer.isOpened():
         capture.release()
         writer.release()
         raise IOError(
-            f"Could not create processed video: {processed_video}"
+            "OpenCV could not create the annotated MP4. Check that the output "
+            "folder is writable and that this OpenCV build supports MP4 writing."
         )
 
     saved_tracks = set()
     plate_cache = {}
     records_by_id = {}
     vehicles = []
+    frame_index = 0
+    last_reported_progress = -1
 
     try:
-        # Reset any existing YOLO tracking state before processing.
-        predictor = getattr(model, "predictor", None)
-
+        # Reset ByteTrack state so IDs from a previous upload are not reused.
+        predictor = getattr(vehicle_model, "predictor", None)
         if predictor is not None:
             for tracker in getattr(predictor, "trackers", []):
                 if hasattr(tracker, "reset"):
                     tracker.reset()
 
-        frame_index = 0
-
         while True:
             ok, frame = capture.read()
-
             if not ok:
                 break
 
             frame_index += 1
-
-            # FIX: pass frame as the first argument.
             annotated, new_vehicles = detect_frame(
                 frame=frame,
                 location=location,
@@ -739,33 +1696,56 @@ def process_video(
                 records_by_id=records_by_id,
             )
 
-            # VideoWriter requires frames of the configured dimensions.
             if annotated.shape[:2] != (height, width):
                 annotated = cv2.resize(
-                    annotated,
-                    (width, height),
-                    interpolation=cv2.INTER_LINEAR,
+                    annotated, (width, height), interpolation=cv2.INTER_LINEAR
                 )
 
             writer.write(annotated)
             vehicles.extend(new_vehicles)
 
+            if total_frames > 0:
+                progress = min(99, int(frame_index * 100 / total_frames))
+            else:
+                # Some containers do not report frame count. Keep progress
+                # indeterminate until EOF rather than failing the upload.
+                progress = min(99, frame_index)
+
+            if progress != last_reported_progress:
+                last_reported_progress = progress
+                if progress_callback:
+                    progress_callback(progress, progress >= 25)
+
+        if frame_index == 0:
+            raise ValueError("No readable frames were found in the uploaded video")
+
     finally:
         capture.release()
         writer.release()
+
+    if not processed_video.exists() or processed_video.stat().st_size == 0:
+        raise IOError("The annotated video could not be saved")
+
+    if progress_callback:
+        progress_callback(100, True)
+
+    warning_count = sum(
+        str(v.get("overload_status", "")).upper() in {"WARNING", "HIGH", "OVERLOADED", "CRITICAL"}
+        for v in vehicles
+    )
+    review_count = sum(
+        str(v.get("overload_status", "")).upper() in {"REVIEW_REQUIRED", "REVIEW", "INDETERMINATE", "UNKNOWN"}
+        for v in vehicles
+    )
 
     return {
         "processed_video": f"/uploads/videos/{processed_video.name}",
         "vehicles": vehicles,
         "stats": {
             "vehicles": len(vehicles),
-            "warnings": sum(
-                v.get("overload_status") == "WARNING"
-                for v in vehicles
-            ),
-            "overloaded": sum(
-                v.get("overload_status") == "OVERLOADED"
-                for v in vehicles
-            ),
+            "warnings": review_count,
+            "overloaded": warning_count,
+            "frames_processed": frame_index,
+            "fps": fps,
         },
     }

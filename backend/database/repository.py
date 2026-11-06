@@ -23,6 +23,7 @@ CSV_FIELDS = [
     "severity_score",
     "location",
     "snapshot",
+    "plate_snippet",
     "timestamp",
     "latitude",
     "longitude",
@@ -84,14 +85,52 @@ def format_snapshot(snapshot):
     return f"/uploads/snapshots/{Path(value).name}"
 
 
+def format_plate_snippet(plate_snippet):
+    """Convert a stored plate-crop path into a URL served by FastAPI."""
+    if not plate_snippet:
+        return None
+
+    value = str(plate_snippet).replace("\\\\", "/")
+
+    if value.startswith(("http://", "https://")):
+        return value
+
+    if value.startswith("/uploads/"):
+        return value
+
+    marker = "uploads/"
+    if marker in value:
+        return "/" + marker + value.split(marker, 1)[1].lstrip("/")
+
+    return f"/uploads/plates/{Path(value).name}"
+
+
 def _ensure_csv():
-    """Create the CSV file and header if they do not exist."""
+    """Create the CSV or safely add newly introduced columns to an old file."""
     CSV_FILE.parent.mkdir(parents=True, exist_ok=True)
 
     if not CSV_FILE.exists() or CSV_FILE.stat().st_size == 0:
         with CSV_FILE.open("w", newline="", encoding="utf-8-sig") as file:
             writer = csv.DictWriter(file, fieldnames=CSV_FIELDS)
             writer.writeheader()
+        return
+
+    # Existing detections.csv files may predate the plate_snippet column.
+    # Migrate their header without discarding any saved detections.
+    with CSV_FILE.open("r", newline="", encoding="utf-8-sig") as file:
+        reader = csv.DictReader(file)
+        old_fields = reader.fieldnames or []
+        if all(field in old_fields for field in CSV_FIELDS):
+            return
+        existing_rows = list(reader)
+
+    temporary_file = CSV_FILE.with_suffix(".csv.migrating")
+    with temporary_file.open("w", newline="", encoding="utf-8-sig") as file:
+        writer = csv.DictWriter(file, fieldnames=CSV_FIELDS)
+        writer.writeheader()
+        for row in existing_rows:
+            writer.writerow({field: row.get(field, "") or "" for field in CSV_FIELDS})
+    temporary_file.replace(CSV_FILE)
 
 
 def _to_record(row):
@@ -186,6 +225,7 @@ def _apply_optional_fields(
     severity_score=None,
     location=None,
     snapshot=None,
+    plate_snippet=None,
     latitude=None,
     longitude=None,
 ):
@@ -197,6 +237,7 @@ def _apply_optional_fields(
         "severity_score": severity_score,
         "location": location,
         "snapshot": snapshot,
+        "plate_snippet": plate_snippet,
         "latitude": latitude,
         "longitude": longitude,
     }
@@ -219,6 +260,7 @@ def save_detection(
     severity_score: int = 0,
     location: str = "Unknown",
     snapshot: str = None,
+    plate_snippet: str = None,
     latitude: float = None,
     longitude: float = None,
 ):
@@ -236,6 +278,7 @@ def save_detection(
                 "severity_score": int(severity_score or 0),
                 "location": location or "Unknown",
                 "snapshot": snapshot or "",
+                "plate_snippet": plate_snippet or "",
                 "timestamp": datetime.utcnow().isoformat(),
                 "latitude": latitude,
                 "longitude": longitude,
@@ -263,6 +306,7 @@ def update_detection_by_tracker_id(
     severity_score: int = None,
     location: str = None,
     snapshot: str = None,
+    plate_snippet: str = None,
     latitude: float = None,
     longitude: float = None,
     max_age_minutes: int = 5,
@@ -310,6 +354,7 @@ def update_detection_by_tracker_id(
                 severity_score=severity_score,
                 location=location,
                 snapshot=snapshot,
+                plate_snippet=plate_snippet,
                 latitude=latitude,
                 longitude=longitude,
             )
@@ -338,6 +383,7 @@ def save_or_update_detection(
     severity_score: int = 0,
     location: str = "Unknown",
     snapshot: str = None,
+    plate_snippet: str = None,
     latitude: float = None,
     longitude: float = None,
 ):
@@ -353,6 +399,7 @@ def save_or_update_detection(
         severity_score=severity_score,
         location=location,
         snapshot=snapshot,
+        plate_snippet=plate_snippet,
         latitude=latitude,
         longitude=longitude,
     )
@@ -369,6 +416,7 @@ def save_or_update_detection(
         severity_score=severity_score,
         location=location,
         snapshot=snapshot,
+        plate_snippet=plate_snippet,
         latitude=latitude,
         longitude=longitude,
     )
@@ -381,6 +429,10 @@ def save_or_update_detection(
 def get_all_detections():
     """Return all detections, newest first."""
     rows = _read_rows()
+    for row in rows:
+        row["snapshot"] = format_snapshot(row.get("snapshot"))
+        row["plate_snippet"] = format_plate_snippet(row.get("plate_snippet"))
+
     return sorted(
         rows,
         key=lambda row: _timestamp_value(row.get("timestamp")) or datetime.min,
@@ -414,6 +466,7 @@ def get_latest_detection():
                 "overload_status": latest.overload_status,
                 "location": latest.location,
                 "snapshot": format_snapshot(latest.snapshot),
+                "plate_snippet": format_plate_snippet(latest.get("plate_snippet")),
                 "timestamp": latest.timestamp or None,
                 "latitude": latest.latitude,
                 "longitude": latest.longitude,
