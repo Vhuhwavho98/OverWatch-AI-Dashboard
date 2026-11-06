@@ -2,7 +2,7 @@ from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
 
-MODEL_PATH = BASE_DIR / "yolo11n.pt"
+MODEL_PATH = BASE_DIR / "yolo26n.pt"
 
 UPLOAD_DIR = BASE_DIR / "uploads"
 IMAGE_DIR = UPLOAD_DIR / "images"
