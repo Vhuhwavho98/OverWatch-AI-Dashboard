@@ -1,0 +1,7 @@
+﻿id,tracker_id,vehicle_type,registration_number,confidence,overload_status,severity_score,location,snapshot,timestamp,latitude,longitude
+1,670874461,Car,44SRR,68.67,WARNING,45,"Vorna Valley, Midrand, Gauteng",/uploads/snapshots/ae5f4125445b4395a0d1d66c9461b22c.jpg,2026-11-05T15:39:24.859603,,
+2,21227112,Car,UNKNOWN,91.99,WARNING,45,"Vorna Valley, Midrand, Gauteng",/uploads/snapshots/a0b5d1fe2ae44e8ebbd0670faf7e8ada.jpg,2026-11-05T15:40:25.794815,,
+3,9,Car,UNKNOWN,56.03,WARNING,25,"Vorna Valley, Midrand, Gauteng",/uploads/snapshots/8fa668461c4d4c54be9e345039cd74a6.jpg,2026-11-05T19:02:03.177556,,
+4,10,Car,UNKNOWN,40.75,WARNING,45,"Vorna Valley, Midrand, Gauteng",/uploads/snapshots/84b9eebb0eda415f92cdb754ab37a24f.jpg,2026-11-05T19:02:23.654546,,
+5,11,Car,UNKNOWN,47.78,WARNING,45,"Vorna Valley, Midrand, Gauteng",/uploads/snapshots/572842fabaa1497db18e270952d03358.jpg,2026-11-05T19:02:24.004145,,
+6,15,Truck,UNKNOWN,41.78,WARNING,45,"Vorna Valley, Midrand, Gauteng",/uploads/snapshots/5cae5b3ea0e94a16a813db49cb099ccc.jpg,2026-11-05T19:03:11.276155,,
