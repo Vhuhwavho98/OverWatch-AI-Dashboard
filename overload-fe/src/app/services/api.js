@@ -1,79 +1,134 @@
 
-const API = "http://127.0.0.1:8000";
+ // =======================================
+ // OVERWATCH AI - API CONFIGURATION
+ // =======================================
+ // Optional frontend .env.local setting:
+ // NEXT_PUBLIC_API_URL=http://127.0.0.1:8000
 
+const API = (
+  process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8000"
+).replace(/\/+$/, "");
+
+export const API_BASE_URL = API;
 export const cameraFeed = `${API}/video_feed`;
 
 // =======================================
-// HELPERS
+// MEDIA URL HELPER
 // =======================================
 
 export function mediaUrl(path) {
   if (!path) return null;
 
-  if (path.startsWith("blob:")) return path;
+  const value = String(path);
 
-  if (/^https?:\/\//i.test(path)) return path;
+  if (
+    value.startsWith("blob:") ||
+    value.startsWith("data:") ||
+    /^https?:\/\//i.test(value)
+  ) {
+    return value;
+  }
 
-  return `${API}${path.startsWith("/") ? "" : "/"}${path}`;
+  return `${API}/${value.replace(/^\/+/, "")}`;
 }
 
+// =======================================
+// RESPONSE HANDLER
+// =======================================
+
 async function readResponse(response) {
-  const data = await response.json();
+  const contentType = response.headers.get("content-type") || "";
+
+  const data = contentType.includes("application/json")
+    ? await response.json()
+    : await response.text();
 
   if (!response.ok) {
     const message =
-      typeof data.detail === "string"
-        ? data.detail
-        : data.error || `Request failed: ${response.status}`;
+      typeof data === "object" && data !== null
+        ? data.detail || data.error || data.message
+        : data;
 
-    throw new Error(message);
+    throw new Error(message || `Request failed: ${response.status}`);
   }
 
   return data;
 }
 
 // =======================================
+// FETCH HELPER
+// =======================================
+
+async function apiFetch(endpoint, options = {}) {
+  try {
+    const response = await fetch(`${API}${endpoint}`, options);
+    return await readResponse(response);
+  } catch (error) {
+    if (error?.name === "AbortError") throw error;
+
+    if (error instanceof TypeError) {
+      throw new Error(
+        `Cannot connect to OverWatch AI backend at ${API}. ` +
+        "Check that FastAPI is running and that the frontend is using the correct backend address."
+      );
+    }
+
+    throw error;
+  }
+}
+
+// =======================================
 // DASHBOARD
 // =======================================
 
-export async function getDashboard() {
-  const res = await fetch(`${API}/dashboard`);
-  return readResponse(res);
+export function getDashboard() {
+  return apiFetch("/dashboard");
 }
 
-export async function getLatestDetection() {
-  const res = await fetch(`${API}/dashboard/latest`);
-  return readResponse(res);
+export function getLatestDetection() {
+  return apiFetch("/dashboard/latest");
 }
 
-export async function getDetections() {
-  const res = await fetch(`${API}/detections`);
-  return readResponse(res);
+export function getDetections() {
+  return apiFetch("/detections");
 }
 
-export async function getAlerts() {
-  const res = await fetch(`${API}/alerts`);
-  return readResponse(res);
+export function getAlerts() {
+  return apiFetch("/alerts");
 }
 
+// =======================================
+// JOB STATUS
+// =======================================
 
-export async function updateLocation(location) {
-  const response = await fetch(`${API}/location`, {
+export function getJobStatus(jobId, signal) {
+  if (!jobId) throw new Error("A job ID is required.");
+
+  return apiFetch(`/jobs/${encodeURIComponent(jobId)}`, { signal });
+}
+
+// =======================================
+// GPS LOCATION
+// =======================================
+
+export function updateLocation(location) {
+  if (
+    !location ||
+    typeof location.latitude !== "number" ||
+    typeof location.longitude !== "number"
+  ) {
+    throw new Error("Valid GPS coordinates are required.");
+  }
+
+  return apiFetch("/location", {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       latitude: location.latitude,
       longitude: location.longitude,
+      address: location.address || "",
     }),
   });
-
-  if (!response.ok) {
-    throw new Error("Failed to resolve GPS location");
-  }
-
-  return response.json();
 }
 
 // =======================================
@@ -81,21 +136,20 @@ export async function updateLocation(location) {
 // =======================================
 
 export async function uploadImage(file, location) {
-  const formData = new FormData();
+  if (!file) throw new Error("Please select an image to upload.");
 
+  const formData = new FormData();
   formData.append("file", file);
   formData.append("location", location || "Polokwane Weighbridge");
 
-  const res = await fetch(`${API}/upload/image`, {
+  const data = await apiFetch("/upload/image", {
     method: "POST",
     body: formData,
   });
 
-  const data = await readResponse(res);
-
   return {
     ...data,
-    preview_image: mediaUrl(data.preview_image),
+    preview_image: mediaUrl(data?.preview_image),
   };
 }
 
@@ -104,35 +158,21 @@ export async function uploadImage(file, location) {
 // =======================================
 
 export async function uploadVideo(file, location) {
-  const formData = new FormData();
+  if (!file) throw new Error("Please select a video to upload.");
 
+  const formData = new FormData();
   formData.append("file", file);
   formData.append("location", location || "Polokwane Weighbridge");
 
-  const res = await fetch(`${API}/upload/video`, {
+  const data = await apiFetch("/upload/video", {
     method: "POST",
     body: formData,
   });
 
-  const data = await readResponse(res);
-
   return {
     ...data,
-    preview_video: mediaUrl(data.preview_video),
+    preview_video: mediaUrl(data?.preview_video),
   };
-}
-
-// =======================================
-// CHECK BACKGROUND JOB STATUS
-// =======================================
-
-export async function getJobStatus(jobId, signal) {
-  const res = await fetch(
-    `${API}/jobs/${encodeURIComponent(jobId)}`,
-    { signal }
-  );
-
-  return readResponse(res);
 }
 
 // =======================================
@@ -145,16 +185,19 @@ export async function waitForJob(
   signal,
   interval = 1000
 ) {
+  if (!jobId) throw new Error("A processing job ID is required.");
+
   while (true) {
     if (signal?.aborted) {
       throw new DOMException("Cancelled", "AbortError");
     }
 
     const job = await getJobStatus(jobId, signal);
+    onStatus(job?.status);
 
-    onStatus(job.status);
+    const status = String(job?.status || "").toLowerCase();
 
-    if (job.status === "completed") {
+    if (status === "completed") {
       const result = job.result || {};
 
       return {
@@ -164,24 +207,34 @@ export async function waitForJob(
       };
     }
 
-    if (job.status === "failed") {
+    if (status === "failed" || status === "error") {
       throw new Error(job.error || "Processing failed");
     }
 
     await new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
+      if (signal?.aborted) {
+        reject(new DOMException("Cancelled", "AbortError"));
+        return;
+      }
+
+      let timer;
+
+      const cleanup = () => {
+        clearTimeout(timer);
         signal?.removeEventListener("abort", onAbort);
+      };
+
+      const onAbort = () => {
+        cleanup();
+        reject(new DOMException("Cancelled", "AbortError"));
+      };
+
+      timer = setTimeout(() => {
+        cleanup();
         resolve();
       }, interval);
 
-      function onAbort() {
-        clearTimeout(timer);
-        reject(new DOMException("Cancelled", "AbortError"));
-      }
-
       signal?.addEventListener("abort", onAbort, { once: true });
-
-      if (signal?.aborted) onAbort();
     });
   }
 }

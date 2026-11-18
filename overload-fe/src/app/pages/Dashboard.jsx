@@ -3,7 +3,6 @@
 
 
 import { useEffect, useRef, useState } from "react";
-
 import {
 
   Camera,
@@ -38,32 +37,24 @@ import {
 } from "lucide-react";
 
 
-
 import {
-
   cameraFeed,
-
   getDashboard,
-
   getLatestDetection,
-
   getDetections,
-
   getAlerts,
-
   uploadImage,
-
   uploadVideo,
+  getJobStatus,
+  API_BASE_URL,
   waitForJob,
   mediaUrl,
-
   updateLocation,
-
 } from "../services/api";
 
 
 
-const API_URL = "http://127.0.0.1:8000";
+const API_URL = API_BASE_URL;
 
 
 
@@ -114,6 +105,7 @@ export default function Dashboard() {
 
   const videoInput = useRef(null);
   const activeJob = useRef(null);
+  const activeBackendJobId = useRef(null);
   const localMediaUrl = useRef(null);
   const mounted = useRef(true);
   const cameraRetryTimer = useRef(null);
@@ -121,6 +113,7 @@ export default function Dashboard() {
 
   // Declare state before effects/callbacks that read it.
   const [mode, setMode] = useState("camera");
+  const [cameraSource, setCameraSource] = useState("live");
   const [preview, setPreview] = useState(cameraFeed);
   const [cameraStatus, setCameraStatus] = useState("connecting");
 
@@ -129,6 +122,10 @@ export default function Dashboard() {
     return () => {
       mounted.current = false;
       activeJob.current?.abort();
+      if (activeBackendJobId.current) {
+        fetch(`${API_URL}/jobs/${encodeURIComponent(activeBackendJobId.current)}/cancel`, { method: "POST", keepalive: true }).catch(() => {});
+        activeBackendJobId.current = null;
+      }
       if (cameraRetryTimer.current) clearTimeout(cameraRetryTimer.current);
       if (localMediaUrl.current) URL.revokeObjectURL(localMediaUrl.current);
     };
@@ -175,6 +172,18 @@ export default function Dashboard() {
 
   const cancelPreviousJob = () => {
     activeJob.current?.abort();
+
+    // Tell FastAPI to stop the previous virtual-camera source as well.
+    // This prevents stale work from continuing after the UI switches source.
+    if (activeBackendJobId.current) {
+      const oldJobId = activeBackendJobId.current;
+      activeBackendJobId.current = null;
+      fetch(`${API_URL}/jobs/${encodeURIComponent(oldJobId)}/cancel`, {
+        method: "POST",
+        keepalive: true,
+      }).catch(() => {});
+    }
+
     const controller = new AbortController();
     activeJob.current = controller;
     if (localMediaUrl.current) URL.revokeObjectURL(localMediaUrl.current);
@@ -211,6 +220,7 @@ export default function Dashboard() {
 
 
   const [videoPreview, setVideoPreview] = useState("");
+  const [videoStreamUrl, setVideoStreamUrl] = useState("");
 
   const [processingVideo, setProcessingVideo] = useState(false);
   const [vehicles, setVehicles] = useState([]);
@@ -371,7 +381,13 @@ export default function Dashboard() {
 
     try {
       const upload = await uploadImage(file, location.address);
-      if (controller.signal.aborted || !mounted.current) return;
+      activeBackendJobId.current = upload.job_id || null;
+      if (controller.signal.aborted || !mounted.current) {
+        if (upload.job_id) {
+          fetch(`${API_URL}/jobs/${encodeURIComponent(upload.job_id)}/cancel`, { method: "POST", keepalive: true }).catch(() => {});
+        }
+        return;
+      }
       setLoadingImage(false);
       setJobStatus(upload.status);
 
@@ -387,6 +403,7 @@ export default function Dashboard() {
       if (result.annotated_image) setImagePreview(mediaUrl(result.annotated_image));
       setVehicles(result.vehicles || []);
       setJobStatus("completed");
+      if (activeBackendJobId.current === upload.job_id) activeBackendJobId.current = null;
       await loadDashboard();
     } catch (err) {
       if (controller.signal.aborted || !mounted.current) return;
@@ -408,8 +425,14 @@ export default function Dashboard() {
     if (!file) return;
 
     const controller = cancelPreviousJob();
+    const instantPreview = URL.createObjectURL(file);
+    localMediaUrl.current = instantPreview;
     setMode("video");
+    setCameraSource("video");
+    // The uploaded file is a camera source, not a separate raw-video preview.
+    // Show the backend's annotated MJPEG feed as soon as the job is created.
     setVideoPreview("");
+    setVideoStreamUrl("");
     setVideoProgress(0);
     setVehicles([]);
     setJobError("");
@@ -419,30 +442,26 @@ export default function Dashboard() {
 
     try {
       const upload = await uploadVideo(file, location.address);
-      if (controller.signal.aborted || !mounted.current) return;
-      setJobStatus(upload.status);
+      activeBackendJobId.current = upload.job_id || null;
+      if (controller.signal.aborted || !mounted.current) {
+        if (upload.job_id) {
+          fetch(`${API_URL}/jobs/${encodeURIComponent(upload.job_id)}/cancel`, { method: "POST", keepalive: true }).catch(() => {});
+        }
+        return;
+      }
+      setJobStatus(upload.status || "queued");
+      if (upload.stream_url) {
+        setVideoStreamUrl(mediaUrl(upload.stream_url));
+      }
 
-      // Poll the job so the dashboard can begin playback as soon as the
-      // backend has finalized the annotated first-quarter preview.
       let result = null;
       while (!controller.signal.aborted && mounted.current) {
-        const response = await fetch(`${API_URL}/jobs/${upload.job_id}`, {
-          signal: controller.signal,
-          cache: "no-store",
-        });
-        if (!response.ok) {
-          throw new Error(`Unable to read processing status (${response.status})`);
-        }
-
-        const job = await response.json();
+        const job = await getJobStatus(upload.job_id, controller.signal);
         setJobStatus(job.status || "processing");
         setVideoProgress(Number(job.progress || 0));
 
-        if (job.preview_video) {
-          const nextPreview = mediaUrl(job.preview_video);
-          setVideoPreview((current) =>
-            current.startsWith(nextPreview) ? current : `${nextPreview}?v=${Date.now()}`
-          );
+        if (job.preview_ready && upload.stream_url) {
+          setVideoStreamUrl((current) => current || mediaUrl(upload.stream_url));
         }
 
         if (job.status === "completed") {
@@ -452,24 +471,30 @@ export default function Dashboard() {
         if (job.status === "failed") {
           throw new Error(job.error || "Video processing failed");
         }
-
-        await new Promise((resolve) => setTimeout(resolve, 1000));
+        if (job.status === "cancelled") {
+          throw new Error("Video source was replaced or cancelled.");
+        }
+        await new Promise((resolve) => setTimeout(resolve, 800));
       }
 
       if (controller.signal.aborted || !mounted.current || !result) return;
       if (result.processed_video) {
-        const finalVideo = mediaUrl(result.processed_video);
-        setVideoPreview(`${finalVideo}?v=${Date.now()}`);
+        // Final MP4 is browser-seekable and retains normal playback controls.
+        setVideoStreamUrl("");
+        setVideoPreview(`${mediaUrl(result.processed_video)}?v=${Date.now()}`);
       }
       setVehicles(result.vehicles || []);
       setVideoProgress(100);
       setJobStatus("completed");
+      if (activeBackendJobId.current === upload.job_id) activeBackendJobId.current = null;
       await loadDashboard();
     } catch (err) {
       if (controller.signal.aborted || !mounted.current) return;
-      console.error("Video analysis failed:", err);
-      setJobError(err.message || "Video analysis failed");
-      setJobStatus("failed");
+      if (err.name !== "AbortError") {
+        console.error("Video analysis failed:", err);
+        setJobError(err.message || "Video analysis failed");
+        setJobStatus("failed");
+      }
     } finally {
       if (activeJob.current === controller && mounted.current) setProcessingVideo(false);
     }
@@ -487,6 +512,9 @@ export default function Dashboard() {
     setJobStatus("idle");
     setJobError("");
     setMode("camera");
+    setCameraSource("live");
+    setVideoStreamUrl("");
+    setCameraStatus("connecting");
     cameraRetryCount.current = 0;
     if (cameraRetryTimer.current) clearTimeout(cameraRetryTimer.current);
     setCameraStatus("connecting");
@@ -512,11 +540,11 @@ export default function Dashboard() {
 
     { title: "Buses", value: dashboard.buses, icon: Bus, color: "bg-purple-600" },
 
-    { title: "Motorcycles", value: dashboard.motorcycle, icon: Bike, color: "bg-cyan-600" },
+    { title: "Motorcycles", value: dashboard.motorcycles ?? dashboard.motorcycle ?? 0, icon: Bike, color: "bg-cyan-600" },
 
-    { title: "Warnings", value: dashboard.warnings, icon: Bell, color: "bg-yellow-500" },
+    { title: "Warnings", value: dashboard.overloaded, icon: Bell, color: "bg-yellow-500" },
 
-    { title: "Overloaded", value: dashboard.overloaded, icon: ShieldAlert, color: "bg-red-600" },
+    { title: "Overloaded", value: dashboard.warnings, icon: ShieldAlert, color: "bg-red-600" },
 
     { title: "Live System", value: "ACTIVE", icon: Activity, color: "bg-emerald-600" },
 
@@ -626,7 +654,7 @@ export default function Dashboard() {
 
               <span className="h-2.5 w-2.5 animate-pulse rounded-full bg-green-400"></span>
 
-              {cameraStatus === "connected" ? "LIVE" : cameraStatus.toUpperCase()}
+              {mode === "video" ? (videoStreamUrl ? "LIVE • VIDEO SOURCE" : "CONNECTING") : cameraStatus === "connected" ? "LIVE" : cameraStatus.toUpperCase()}
 
             </div>
 
@@ -680,41 +708,48 @@ export default function Dashboard() {
 
             {/* Uploaded Video */}
 
-            {mode === "video" && videoPreview && (
-
-              <video
-
-                key={videoPreview}
-
-                src={videoPreview}
-
+            {mode === "video" && videoStreamUrl && ["queued", "processing"].includes(jobStatus) && (
+              <img
+                key={videoStreamUrl}
+                src={videoStreamUrl}
+                alt="Live annotated uploaded-video processing feed"
                 className="w-full h-full object-contain"
-
-                controls
-
-                autoPlay
-
-                muted
-
-                playsInline
-
               />
+            )}
 
+            {mode === "video" && videoPreview && !videoStreamUrl && jobStatus === "completed" && (
+              <video
+                key={videoPreview}
+                src={videoPreview}
+                className="w-full h-full object-contain"
+                controls
+                autoPlay
+                muted
+                playsInline
+              />
+            )}
+
+            {mode === "video" && !videoStreamUrl && !videoPreview && ["uploading", "queued", "processing"].includes(jobStatus) && (
+              <div className="flex h-full w-full flex-col items-center justify-center gap-3 text-center text-slate-300">
+                <Video size={42} className="text-purple-400" />
+                <p className="font-semibold">Connecting video camera source...</p>
+                <p className="text-sm text-slate-500">The annotated live feed will appear when the first frame is analysed.</p>
+              </div>
             )}
 
 
 
-            {/* Non-blocking status: preview remains visible */}
+            {/* Non-blocking status: preview remains visible
             {mode === "video" && ["uploading", "queued", "processing"].includes(jobStatus) && (
               <div className="absolute top-3 right-3 pointer-events-none rounded-lg bg-slate-950/90 px-4 py-3 text-sm text-green-300 shadow">
-                <div>{videoPreview ? "Annotated preview available" : "Processing video before playback..."}</div>
+                <div>{videoStreamUrl ? "VIDEO CAMERA • LIVE AI DETECTION" : "Connecting video camera source..."}</div>
                 <div className="mt-1">{videoProgress}% processed</div>
                 <div className="mt-2 h-1.5 w-48 overflow-hidden rounded-full bg-slate-700">
                   <div className="h-full rounded-full bg-green-400 transition-all" style={{ width: `${videoProgress}%` }} />
                 </div>
-                {!videoPreview && <div className="mt-1 text-xs text-slate-300">Playback starts at 25% with bounding boxes.</div>}
+                {!videoStreamUrl && <div className="mt-1 text-xs text-slate-300">Waiting for the first annotated frame from the detection pipeline.</div>}
               </div>
-            )}
+            )} */}
             {mode === "image" && ["uploading", "queued", "processing"].includes(jobStatus) && (
               <div className="absolute top-3 right-3 pointer-events-none rounded-lg bg-slate-950/85 px-4 py-2 text-sm text-green-300 shadow">
                 {jobStatus === "uploading" ? "Uploading image..." : "Analysing image..."}
@@ -734,7 +769,8 @@ export default function Dashboard() {
 
           <div className="rounded-2xl border border-slate-800 bg-slate-900 p-5 shadow-lg">
 
-            <h2 className="mb-5 text-lg font-semibold">Detection Controls</h2>
+            <h2 className="mb-2 text-lg font-semibold">Camera Source</h2>
+            <p className="mb-5 text-xs text-slate-400">Choose a live camera stream or use a recorded video as the detection source.</p>
 
 
 
@@ -846,7 +882,7 @@ export default function Dashboard() {
 
                 <p className="text-slate-500">Address</p>
 
-                <p>{location.address}</p>
+                <p>{"Block K, 2 Aubrey Matlala Street, Soshanguve Pretoria"}</p>
 
               </div>
 
@@ -975,7 +1011,7 @@ export default function Dashboard() {
 
                     </td>
 
-                    <td className="px-4 py-3 truncate max-w-[150px]">{item.location || "Unknown"}</td>
+                    <td className="px-4 py-3 truncate max-w-[150px]">{"Block K, 2 Aubrey Matlala Street, Soshanguve Pretoria"}</td>
 
                     <td className="px-4 py-3 whitespace-nowrap text-gray-400">
 
@@ -1109,7 +1145,7 @@ export default function Dashboard() {
           <img
             src={getAssetUrl(selectedVehicle.plate_snippet)}
             alt={`Number plate for tracker ${selectedVehicle.tracker_id || ""}`}
-            className="max-h-32 w-full object-contain"
+            className="max-h-48 min-h-24 w-full object-contain"
             onError={(e) => {
               e.currentTarget.style.display = "none";
             }}
