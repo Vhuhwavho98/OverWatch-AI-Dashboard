@@ -12,3 +12,4 @@ Pillow
 easyocr
 SQLAlchemy
 pyodbc
+opencv-python-headless
