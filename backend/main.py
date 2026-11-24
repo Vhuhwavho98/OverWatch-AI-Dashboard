@@ -55,7 +55,7 @@ app = FastAPI(title="OverWatch AI")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "https://YOUR-VERCEL-DOMAIN.vercel.app"
+        "https://over-watch-ai-dashboard.vercel.app/"
     ],
     allow_credentials=True,
     allow_methods=["*"],
