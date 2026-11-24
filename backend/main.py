@@ -44,6 +44,7 @@ from database.repository import (
 )
 
 from datetime import datetime, timezone, timedelta
+from fastapi.middleware.cors import CORSMiddleware
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +52,15 @@ logger = logging.getLogger(__name__)
 app = FastAPI(title="OverWatch AI")
 
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://YOUR-VERCEL-DOMAIN.vercel.app"
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # ============================================================
 # CSV MIRROR PERSISTENCE
