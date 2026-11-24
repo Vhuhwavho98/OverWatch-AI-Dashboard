@@ -77,6 +77,38 @@ const getAssetUrl = (path) => {
 };
 
 
+// Always display detection timestamps in South African time.
+const formatSAST = (timestamp) => {
+  if (!timestamp) return "N/A";
+
+  let value = timestamp;
+
+  if (typeof value === "string") {
+    value = value.trim().replace(" ", "T");
+
+    // Treat timezone-less backend timestamps as UTC.
+    if (!/(Z|[+-]\d{2}:\d{2})$/i.test(value)) {
+      value += "Z";
+    }
+  }
+
+  const date = new Date(value);
+
+  if (Number.isNaN(date.getTime())) return "N/A";
+
+  return new Intl.DateTimeFormat("en-ZA", {
+    timeZone: "Africa/Johannesburg",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  }).format(date);
+};
+
+
 // Keep backend status values consistent in the dashboard.
 const normaliseStatus = (value) => {
   const status = String(value || "NORMAL").trim().toUpperCase();
@@ -1003,7 +1035,7 @@ export default function Dashboard() {
 
                     <td className="px-4 py-3 whitespace-nowrap text-gray-400">
 
-                      {item.timestamp ? new Date(item.timestamp).toLocaleString("en-ZA") : "N/A"}
+                      {formatSAST(item.timestamp)}
 
                     </td>
 
@@ -1110,9 +1142,7 @@ export default function Dashboard() {
     ["Location", selectedVehicle.location || "Unknown"],
     [
       "Detected at",
-      selectedVehicle.timestamp
-        ? new Date(selectedVehicle.timestamp).toLocaleString("en-ZA")
-        : "N/A",
+     formatSAST(selectedVehicle.timestamp),
     ],
   ].map(([label, value]) => (
     <div key={label} className="border-b border-slate-800 pb-3">
