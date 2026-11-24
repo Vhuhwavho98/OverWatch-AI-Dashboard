@@ -21,26 +21,6 @@ const menuItems = [
     icon: LayoutDashboard,
   },
   {
-    title: "Live Camera",
-    href: "/camera",
-    icon: Camera,
-  },
-  {
-    title: "Image Detection",
-    href: "/image",
-    icon: ImageIcon,
-  },
-  {
-    title: "Video Detection",
-    href: "/video",
-    icon: Video,
-  },
-  {
-    title: "Detection History",
-    href: "/history",
-    icon: History,
-  },
-  {
     title: "Alerts",
     href: "/alerts",
     icon: Bell,
