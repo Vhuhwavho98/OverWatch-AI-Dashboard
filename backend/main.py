@@ -30,7 +30,8 @@ from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.encoders import jsonable_encoder
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, Response
+from services.yolo_service import detect_frame
 from fastapi.staticfiles import StaticFiles
 
 from services.ocr_service import detect_plate
@@ -55,7 +56,7 @@ app = FastAPI(title="OverWatch AI")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "https://over-watch-ai-dashboard.vercel.app/"
+        "https://YOUR-VERCEL-DOMAIN.vercel.app"
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -187,6 +188,101 @@ def _csv_upsert_vehicle(
     except Exception:
         logger.exception("[CSV] Failed to save tracker_id=%s to %s", tracker_id, CSV_FILE)
         raise
+
+
+    # ==========================================
+# BROWSER CAMERA INFERENCE
+# ==========================================
+
+browser_camera_lock = threading.Lock()
+
+browser_saved_tracks = set()
+browser_plate_cache = {}
+browser_records_by_id = {}
+browser_frame_index = 0
+
+
+@app.post("/camera/frame")
+def process_browser_camera_frame(
+    file: UploadFile = File(...),
+    location: str = Form("Polokwane Weighbridge"),
+):
+    global browser_frame_index
+
+    if not file.content_type or not file.content_type.startswith("image/"):
+        raise HTTPException(
+            status_code=400,
+            detail="A valid camera image is required."
+        )
+
+    try:
+        image_bytes = file.file.read()
+
+        if not image_bytes or len(image_bytes) > 8 * 1024 * 1024:
+            raise HTTPException(
+                status_code=400,
+                detail="Image is empty or exceeds the 8 MB limit."
+            )
+
+        image_array = np.frombuffer(image_bytes, dtype=np.uint8)
+        frame = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
+
+        if frame is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Unable to decode camera image."
+            )
+
+        with browser_camera_lock:
+            browser_frame_index += 1
+
+            annotated, vehicles = detect_frame(
+                frame=frame,
+                location=location,
+                saved_tracks=browser_saved_tracks,
+                plate_cache=browser_plate_cache,
+                frame_index=browser_frame_index,
+                records_by_id=browser_records_by_id,
+            )
+
+        if annotated is None:
+            raise HTTPException(
+                status_code=500,
+                detail="YOLO returned an empty frame."
+            )
+
+        success, buffer = cv2.imencode(
+            ".jpg",
+            annotated,
+            [cv2.IMWRITE_JPEG_QUALITY, 85]
+        )
+
+        if not success:
+            raise HTTPException(
+                status_code=500,
+                detail="Could not encode annotated image."
+            )
+
+        return Response(
+            content=buffer.tobytes(),
+            media_type="image/jpeg",
+            headers={
+                "Cache-Control": "no-store",
+                "X-Detection-Count": str(
+                    len(vehicles) if isinstance(vehicles, (list, tuple)) else 0
+                ),
+            }
+        )
+
+    except HTTPException:
+        raise
+
+    except Exception:
+        logger.exception("Browser camera inference failed")
+        raise HTTPException(
+            status_code=500,
+            detail="Camera inference failed."
+        )
 
 
 def _csv_update_registration(tracker_id, registration_number, location, plate_snippet=None):
