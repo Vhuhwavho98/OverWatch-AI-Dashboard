@@ -3,6 +3,9 @@
 
 
 import { useEffect, useRef, useState } from "react";
+
+import CameraStream from "../components/CameraStream";
+
 import {
 
   Camera,
@@ -666,26 +669,11 @@ export default function Dashboard() {
 
             {/* Camera */}
 
-            {mode === "camera" && (
+          {mode === "camera" && (
 
-              <img
-
-                key={preview}
-
-                src={preview}
-
-                alt="Live Camera"
-
-                onLoad={handleCameraLoad}
-
-                onError={handleCameraError}
-
-                className="w-full h-full object-contain"
-
-              />
+              <CameraStream />
 
             )}
-
 
 
             {/* Uploaded Image */}
