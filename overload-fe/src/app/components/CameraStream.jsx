@@ -1,7 +1,11 @@
 
 "use client";
 
-const STREAM_URL = "http://127.0.0.1:8000/video_feed";
+
+const API = "https://name-contribution-rapids-programmer.trycloudflare.com";
+
+export const API_BASE_URL = API;
+export const cameraFeed = `${API}/video_feed`;
 
 export default function CameraStream() {
   return (
