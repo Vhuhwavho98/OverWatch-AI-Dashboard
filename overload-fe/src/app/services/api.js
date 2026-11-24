@@ -5,7 +5,7 @@
  // Optional frontend .env.local setting:
  // NEXT_PUBLIC_API_URL=http://127.0.0.1:8000
 
-const API ="https://mega-gaps-locked-dvds.trycloudflare.com"
+const API ="https://name-contribution-rapids-programmer.trycloudflare.com"
 
 export const API_BASE_URL = API;
 export const cameraFeed = `${API}/video_feed`;
